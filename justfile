@@ -204,6 +204,7 @@ check:
     cargo +nightly fmt --all -- --check
     git diff --check
     cargo +{{ toolchain }} check -p atuin-pty-proxy
+    cargo +{{ toolchain }} test -p atuin-pty-proxy
 
 # Build the complete Atuin binary containing the patched proxy.
 build: check
