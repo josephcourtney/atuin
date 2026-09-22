@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use atuin_common::os::unix::io::WriteAllExt;
 use atuin_common::os::unix::tty::TtyId;
@@ -220,10 +219,15 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
         .ok();
 
     let (msg_tx, msg_rx) = mpsc::sync_channel::<Msg>(64);
-    let _parser_handle = screen::spawn_parser_thread(rows, cols, msg_rx, screen::ParserOptions {
-        command_capture: options.command_capture,
-        debug_osc133: options.debug_osc133,
-    });
+    let _parser_handle = screen::spawn_parser_thread(
+        rows,
+        cols,
+        msg_rx,
+        screen::ParserOptions {
+            command_capture: options.command_capture,
+            debug_osc133: options.debug_osc133,
+        },
+    );
 
     let socket_path = if let Some((server, path)) = server_and_path {
         server.spawn(msg_tx.clone());
@@ -277,7 +281,6 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
     let stdout_thread = std::thread::spawn(move || {
         let stdout = rustix::stdio::stdout();
 
-        const WRITE_TIMEOUT: Duration = Duration::from_millis(150);
         let mut highlighter = options.debug_osc133.then(Osc133DebugHighlighter::new);
         let mut kitty_filter = kitty_osc133_compat.then(KittyOsc133Filter::new);
         let mut buf = [0u8; 8192];
@@ -321,7 +324,7 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
         }
 
         if highlighter.is_some() {
-            let _ = stdout.write_all_retrying(RESET, WRITE_TIMEOUT);
+            let _ = stdout.write_all_retrying(RESET);
         }
     });
 
