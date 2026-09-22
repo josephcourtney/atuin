@@ -67,7 +67,6 @@ enum Error {
 }
 
 fn run(options: RuntimeOptions) -> Result<(), Error> {
-fn run(options: RuntimeOptions) -> eyre::Result<()> {
     let window_size = terminal::window_size()?;
     let rows = window_size.rows;
     let cols = window_size.columns;
@@ -110,10 +109,15 @@ fn run(options: RuntimeOptions) -> eyre::Result<()> {
         .ok();
 
     let (msg_tx, msg_rx) = mpsc::sync_channel::<Msg>(64);
-    let _parser_handle = screen::spawn_parser_thread(rows, cols, msg_rx, screen::ParserOptions {
-        command_capture: options.command_capture,
-        debug_osc133: options.debug_osc133,
-    });
+    let _parser_handle = screen::spawn_parser_thread(
+        rows,
+        cols,
+        msg_rx,
+        screen::ParserOptions {
+            command_capture: options.command_capture,
+            debug_osc133: options.debug_osc133,
+        },
+    );
 
     let socket_path = if let Some((server, path)) = server_and_path {
         server.spawn(msg_tx.clone());
