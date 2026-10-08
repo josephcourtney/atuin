@@ -68,6 +68,10 @@ enum Error {
 }
 
 fn run(options: RuntimeOptions) -> Result<(), Error> {
+    crate::diagnostics::event(
+        "proxy_start",
+        format_args!("capture_enabled={} kitty_env={}", options.command_capture.is_some(), std::env::var_os("KITTY_WINDOW_ID").is_some()),
+    );
     let window_size = terminal::window_size()?;
     let rows = window_size.rows;
     let cols = window_size.columns;
@@ -172,6 +176,7 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
         }
     };
 
+    crate::diagnostics::event("terminal_filter", format_args!("kitty_compat={kitty_osc133_compat}"));
     let stdout_thread = std::thread::spawn(move || {
         let stdout = rustix::stdio::stdout();
 
@@ -185,7 +190,12 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let raw_data = &buf[..n];
-                    let _ = msg_tx.send(Msg::Data(raw_data.to_vec()));
+                    if crate::diagnostics::enabled() {
+                        crate::diagnostics::event("pty_read", format_args!("bytes={n}"));
+                    }
+                    if msg_tx.send(Msg::Data(raw_data.to_vec())).is_err() {
+                        crate::diagnostics::event("parser_queue_error", "receiver_disconnected");
+                    }
                     cwd_updater.update();
 
                     let filtered;
