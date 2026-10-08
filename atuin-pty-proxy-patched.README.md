@@ -27,3 +27,38 @@ the patched executable. Run `just help` for upgrade/build/install instructions.
 For future upstream release rebases, preserve both the pixel-size propagation
 and OSC 133 compatibility logic. The `justfile` imports shared local recipes
 from `~/.config/just/lib/`, so those recipes are required for `just` commands.
+
+## Capture diagnostics
+
+The patched proxy supports an opt-in, metadata-only trace. Set
+`ATUIN_PTY_CAPTURE_DIAGNOSTICS` to an **absolute file path** before starting
+a *new* Kitty window / PTY proxy; `0` or unset disables diagnostics.
+
+Example:
+
+```sh
+ATUIN_PTY_CAPTURE_DIAGNOSTICS="$HOME/atuin-pty-capture.log" kitty
+```
+
+The file is opened with restrictive permissions (0600). The trace reports
+proxy startup, whether a command-capture sink is configured, Kitty compatibility
+mode, PTY read byte counts, parser queue failures, OSC 133 event kinds,
+semantic zone changes, capture resets, missing/invalid history-ID markers,
+completed capture byte counts, and sink invocation/return. It **never writes
+captured terminal content, OSC parameter values, commands, or history IDs**.
+The log does contain process identifiers, event timing, and command-output
+lengths; review it before sharing.
+
+Interpretation:
+
+- `proxy_start capture_enabled=false`: the proxy was launched without capture
+  configuration; check Atuin CLI setup before inspecting shell markers.
+- No `osc133_marker` despite `pty_read`: shell integration is not emitting
+  recognized markers, or the parser is not recognizing them.
+- `capture_pending`: a finish marker lacked a parseable history ID.
+- `capture_ready` and `sink_return`: the proxy submitted the capture to its
+  configured sink. **This does not prove daemon acceptance or persistence.**
+  If output is still unavailable, instrument the sink/daemon separately.
+
+Do not enable diagnostics indefinitely: the logger appends a record for
+each PTY read and can generate significant disk usage.
