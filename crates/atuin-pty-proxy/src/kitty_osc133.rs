@@ -24,7 +24,10 @@ pub(crate) struct KittyOsc133Filter {
 
 impl KittyOsc133Filter {
     pub(crate) fn new() -> Self {
-        Self { state: State::Ground, pending: Vec::new() }
+        Self {
+            state: State::Ground,
+            pending: Vec::new(),
+        }
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<u8> {
@@ -95,7 +98,11 @@ impl KittyOsc133Filter {
     fn complete(&mut self, out: &mut Vec<u8>) {
         let marker = std::mem::take(&mut self.pending);
         self.state = State::Ground;
-        let terminator_len = if marker.ends_with(b"\x1b\\") { 2 } else { 1 };
+        let terminator_len = if marker.ends_with(b"\x1b\\") {
+            2
+        } else {
+            1
+        };
         let body = &marker[PREFIX.len()..marker.len() - terminator_len];
 
         if let Some(rest) = body.strip_prefix(b"D;") {
