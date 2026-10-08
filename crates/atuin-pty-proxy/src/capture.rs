@@ -111,6 +111,9 @@ impl TrackerCore {
     /// This is a no-op if we're already in that zone.
     fn enter_zone(&mut self, zone: Zone) {
         let current_zone = self.zone();
+        if current_zone != zone {
+            crate::diagnostics::event("zone_change", format_args!("from={current_zone:?} to={zone:?}"));
+        }
         if zone == self.zone() {
             return;
         }
@@ -136,6 +139,7 @@ impl TrackerCore {
             // If we're in the `Output` zone (capturing command output) but we transition directly
             // into `Prompt` or `Input` (starting a new command), also clear the capture. Without a
             // history ID, we can't do anything with it.
+            crate::diagnostics::event("capture_reset", format_args!("from={current_zone:?} to={zone:?}"));
             self.clear_capture();
         } else if current_zone == Zone::Output {
             let mut contents = self.take_rendered();
@@ -189,6 +193,7 @@ impl TrackerCore {
 
     fn handle_chunk<'a>(&mut self, chunk: EventChunk<'_>, params: impl Iterator<Item = Param<'a>>) {
         let prev_zone = self.zone();
+        crate::diagnostics::event("osc133_marker", format_args!("kind={:?} from_zone={prev_zone:?}", chunk.event));
         self.enter_zone(chunk.event.zone());
 
         let Event::CommandFinished { .. } = chunk.event else {
@@ -225,7 +230,17 @@ impl TrackerCore {
         };
 
         let state = std::mem::take(&mut self.capture);
+        crate::diagnostics::event(
+            "capture_ready",
+            format_args!(
+                "start_chars={} end_chars={} observed_bytes={}",
+                state.output_start.len(),
+                state.output_end.as_ref().map_or(0, String::len),
+                state.output_observed_bytes
+            ),
+        );
         let (rows, cols) = self.emulator.screen().size();
+        crate::diagnostics::event("sink_invoke", "capture_completed");
         (self.sink)(history_id, CommandCapture {
             output_start: state.output_start,
             output_end: state.output_end,
@@ -233,6 +248,7 @@ impl TrackerCore {
             terminal_width: cols.get(),
             terminal_height: rows.get(),
         });
+        crate::diagnostics::event("sink_return", "capture_completed");
     }
 
     /// Pass data to the vt100 emulator, adding it to the output total if necessary.
