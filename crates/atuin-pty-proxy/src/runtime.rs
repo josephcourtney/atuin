@@ -8,8 +8,8 @@ use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::cwd_updater::CwdUpdater;
-use crate::kitty_osc133::KittyOsc133Filter;
 use crate::debug::{Osc133DebugHighlighter, RESET};
+use crate::kitty_osc133::KittyOsc133Filter;
 use crate::pty_proxy::RuntimeOptions;
 use crate::screen::{self, Msg, SocketServer};
 
