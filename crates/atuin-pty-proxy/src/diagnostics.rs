@@ -21,12 +21,19 @@ fn logger() -> Option<&'static Logger> {
         // An explicit path avoids accidentally writing sensitive diagnostics to the
         // terminal or an unexpected working directory.
         let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return None;
+        }
         let file = OpenOptions::new().create(true).append(true).mode(0o600).open(&path).ok()?;
         if file.set_permissions(std::fs::Permissions::from_mode(0o600)).is_err() {
             return None;
         }
-        Some(Logger { file: Mutex::new(file), start: Instant::now() })
-    }).as_ref()
+        Some(Logger {
+            file: Mutex::new(file),
+            start: Instant::now(),
+        })
+    })
+    .as_ref()
 }
 
 pub(crate) fn enabled() -> bool {
@@ -36,7 +43,14 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn event(kind: &str, detail: impl std::fmt::Display) {
     if let Some(logger) = logger() {
         if let Ok(mut file) = logger.file.lock() {
-            let _ = writeln!(file, "elapsed_ms={} pid={} event={} {}", logger.start.elapsed().as_millis(), std::process::id(), kind, detail);
+            let _ = writeln!(
+                file,
+                "elapsed_ms={} pid={} event={} {}",
+                logger.start.elapsed().as_millis(),
+                std::process::id(),
+                kind,
+                detail
+            );
         }
     }
 }
