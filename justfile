@@ -4,9 +4,9 @@ import '~/.config/just/lib/downstream-patch.just'
 import '~/.config/just/lib/versioned-install.just'
 
 # Generic downstream-patch configuration.
-patch_branch := "fix-pty-pixel-size"
+patch_branch := "patched-pty-proxy"
 patch_base_file := ".patch-base.env"
-patch_upstream_remote := "origin"
+patch_upstream_remote := "upstream"
 patch_release_prefix := "v"
 
 # Atuin-specific configuration.

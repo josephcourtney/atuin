@@ -333,10 +333,7 @@ static SECRET_PATTERNS: &[Pattern] = &[
                 input: "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
                 redacted: "https://hooks.slack.com/services/****",
             },
-            Test {
-                input: "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
-                redacted: REDACTED,
-            },
+            Test { input: "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX", redacted: REDACTED },
         ],
     },
     Pattern {
