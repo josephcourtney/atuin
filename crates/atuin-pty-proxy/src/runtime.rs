@@ -8,6 +8,7 @@ use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::cwd_updater::CwdUpdater;
+use crate::kitty_osc133::KittyOsc133Filter;
 use crate::debug::{Osc133DebugHighlighter, RESET};
 use crate::pty_proxy::RuntimeOptions;
 use crate::screen::{self, Msg, SocketServer};
@@ -64,117 +65,6 @@ enum Error {
     TakeWriter(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-const OSC133_PREFIX: &[u8] = b"\x1b]133;";
-const MAX_BUFFERED_OSC133: usize = 4096;
-
-#[derive(Debug, Clone, Copy)]
-enum KittyOsc133State {
-    Ground,
-    Prefix(usize),
-    Osc133,
-}
-
-struct KittyOsc133Filter {
-    state: KittyOsc133State,
-    pending: Vec<u8>,
-}
-
-impl KittyOsc133Filter {
-    fn new() -> Self {
-        Self {
-            state: KittyOsc133State::Ground,
-            pending: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(data.len());
-
-        for &byte in data {
-            match self.state {
-                KittyOsc133State::Ground => {
-                    if byte == OSC133_PREFIX[0] {
-                        self.pending.push(byte);
-                        self.state = KittyOsc133State::Prefix(1);
-                    } else {
-                        out.push(byte);
-                    }
-                }
-                KittyOsc133State::Prefix(pos) => {
-                    if byte == OSC133_PREFIX[pos] {
-                        self.pending.push(byte);
-                        let next = pos + 1;
-
-                        if next == OSC133_PREFIX.len() {
-                            self.state = KittyOsc133State::Osc133;
-                        } else {
-                            self.state = KittyOsc133State::Prefix(next);
-                        }
-                    } else if byte == OSC133_PREFIX[0] {
-                        out.append(&mut self.pending);
-                        self.pending.push(byte);
-                        self.state = KittyOsc133State::Prefix(1);
-                    } else {
-                        self.pending.push(byte);
-                        out.append(&mut self.pending);
-                        self.state = KittyOsc133State::Ground;
-                    }
-                }
-                KittyOsc133State::Osc133 => {
-                    self.pending.push(byte);
-
-                    let terminated =
-                        byte == b'\x07' || byte == b'\x9c' || self.pending.ends_with(b"\x1b\\");
-
-                    if terminated {
-                        Self::emit_marker(&self.pending, &mut out);
-                        self.pending.clear();
-                        self.state = KittyOsc133State::Ground;
-                    } else if self.pending.len() > MAX_BUFFERED_OSC133 {
-                        out.append(&mut self.pending);
-                        self.state = KittyOsc133State::Ground;
-                    }
-                }
-            }
-        }
-
-        out
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        self.state = KittyOsc133State::Ground;
-        std::mem::take(&mut self.pending)
-    }
-
-    fn emit_marker(marker: &[u8], out: &mut Vec<u8>) {
-        let (body_end, terminator): (usize, &[u8]) = if marker.ends_with(b"\x1b\\") {
-            (marker.len() - 2, b"\x1b\\")
-        } else {
-            (marker.len() - 1, &marker[marker.len() - 1..])
-        };
-
-        let body = &marker[OSC133_PREFIX.len()..body_end];
-
-        if let Some(rest) = body.strip_prefix(b"D;") {
-            if let Some(status_end) = rest.iter().position(|&byte| byte == b';') {
-                let status = &rest[..status_end];
-                let params = &rest[status_end + 1..];
-
-                if params.split(|&byte| byte == b';').any(|param| param.starts_with(b"history_id="))
-                {
-                    out.extend_from_slice(OSC133_PREFIX);
-                    out.extend_from_slice(b"D;");
-                    out.extend_from_slice(status);
-                    out.extend_from_slice(terminator);
-                    return;
-                }
-            }
-        }
-
-        out.extend_from_slice(marker);
-    }
 }
 
 fn run(options: RuntimeOptions) -> Result<(), Error> {
@@ -272,7 +162,15 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
     spawn_resize_handler(pair.master, msg_tx.clone())?;
     terminal::enable_raw_mode()?;
 
-    let kitty_osc133_compat = std::env::var_os("KITTY_WINDOW_ID").is_some();
+    let kitty_osc133_compat = match std::env::var("ATUIN_PTY_OSC133_COMPAT").as_deref() {
+        Ok("kitty") => true,
+        Ok("off") => false,
+        Ok("auto") | Err(_) => std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        Ok(value) => {
+            eprintln!("atuin pty-proxy: unknown ATUIN_PTY_OSC133_COMPAT={value:?}; using auto");
+            std::env::var_os("KITTY_WINDOW_ID").is_some()
+        }
+    };
 
     let stdout_thread = std::thread::spawn(move || {
         let stdout = rustix::stdio::stdout();
@@ -390,64 +288,7 @@ mod tests {
     use easy_cast::Conv;
     use rstest::rstest;
 
-    use super::{CommandBuilder, KittyOsc133Filter, process_exit_code, set_child_env};
-
-    #[test]
-    fn kitty_filter_sanitizes_atuin_finished_marker() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert_eq!(
-            filter.push(b"\x1b]133;D;42;history_id=018f;session_id=abcd\x07"),
-            b"\x1b]133;D;42\x07"
-        );
-    }
-
-    #[test]
-    fn kitty_filter_preserves_plain_finished_marker() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert_eq!(filter.push(b"\x1b]133;D;42\x07"), b"\x1b]133;D;42\x07");
-    }
-
-    #[test]
-    fn kitty_filter_preserves_other_osc133_markers() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert_eq!(filter.push(b"\x1b]133;C;cmdline=false\x07"), b"\x1b]133;C;cmdline=false\x07");
-    }
-
-    #[test]
-    fn kitty_filter_handles_marker_split_across_reads() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert_eq!(filter.push(b"hello\x1b]133;D"), b"hello");
-        assert_eq!(
-            filter.push(b";37;history_id=018f;session_id=abcd\x07world"),
-            b"\x1b]133;D;37\x07world"
-        );
-    }
-
-    #[test]
-    fn kitty_filter_handles_st_terminated_marker() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert_eq!(filter.push(b"\x1b]133;D;7;history_id=018f\x1b\\"), b"\x1b]133;D;7\x1b\\");
-    }
-
-    #[test]
-    fn kitty_filter_preserves_non_osc133_escape_sequences() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert_eq!(filter.push(b"\x1b[31mred\x1b[0m"), b"\x1b[31mred\x1b[0m");
-    }
-
-    #[test]
-    fn kitty_filter_flushes_incomplete_sequence_on_finish() {
-        let mut filter = KittyOsc133Filter::new();
-
-        assert!(filter.push(b"\x1b]133;D;42;history_id=018f").is_empty());
-        assert_eq!(filter.finish(), b"\x1b]133;D;42;history_id=018f");
-    }
+    use super::{CommandBuilder, process_exit_code, set_child_env};
 
     #[rstest]
     #[case::zero(0, 0)]
