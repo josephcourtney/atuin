@@ -5,6 +5,8 @@ mod cwd_updater;
 #[cfg(unix)]
 mod debug;
 #[cfg(unix)]
+mod kitty_osc133;
+#[cfg(unix)]
 mod osc133;
 #[cfg(unix)]
 mod pty_proxy;
