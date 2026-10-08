@@ -112,7 +112,10 @@ impl TrackerCore {
     fn enter_zone(&mut self, zone: Zone) {
         let current_zone = self.zone();
         if current_zone != zone {
-            crate::diagnostics::event("zone_change", format_args!("from={current_zone:?} to={zone:?}"));
+            crate::diagnostics::event(
+                "zone_change",
+                format_args!("from={current_zone:?} to={zone:?}"),
+            );
         }
         if zone == self.zone() {
             return;
@@ -139,7 +142,10 @@ impl TrackerCore {
             // If we're in the `Output` zone (capturing command output) but we transition directly
             // into `Prompt` or `Input` (starting a new command), also clear the capture. Without a
             // history ID, we can't do anything with it.
-            crate::diagnostics::event("capture_reset", format_args!("from={current_zone:?} to={zone:?}"));
+            crate::diagnostics::event(
+                "capture_reset",
+                format_args!("from={current_zone:?} to={zone:?}"),
+            );
             self.clear_capture();
         } else if current_zone == Zone::Output {
             let mut contents = self.take_rendered();
@@ -193,7 +199,10 @@ impl TrackerCore {
 
     fn handle_chunk<'a>(&mut self, chunk: EventChunk<'_>, params: impl Iterator<Item = Param<'a>>) {
         let prev_zone = self.zone();
-        crate::diagnostics::event("osc133_marker", format_args!("kind={:?} from_zone={prev_zone:?}", chunk.event));
+        crate::diagnostics::event(
+            "osc133_marker",
+            format_args!("kind={:?} from_zone={prev_zone:?}", chunk.event),
+        );
         self.enter_zone(chunk.event.zone());
 
         let Event::CommandFinished { .. } = chunk.event else {
