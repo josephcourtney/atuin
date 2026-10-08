@@ -14,7 +14,7 @@ patched_bin := env_var("HOME") / ".local/bin/atuin-patched"
 atuin_bin := "/opt/homebrew/bin/atuin"
 toolchain := "1.98.0"
 
-# The upstream file intentionally changed by this patch.
+# Primary upstream file for PTY integration; the filter lives in kitty_osc133.rs.
 patch_target := "crates/atuin-pty-proxy/src/runtime.rs"
 
 default:
@@ -26,7 +26,7 @@ help:
     Atuin patched PTY proxy
     =======================
 
-    This fork propagates terminal pixel dimensions through Atuin's PTY proxy.
+    This fork propagates PTY pixel dimensions and sanitizes Kitty OSC 133 markers.\n    Set ATUIN_PTY_OSC133_COMPAT=auto|kitty|off (default auto).
     Generic downstream-patch state is stored in .patch-base.env.
 
     Typical upgrade
@@ -49,7 +49,7 @@ help:
 
     If rebase conflicts
     -------------------
-      # preserve terminal::window_size() and pixel width/height propagation
+      # preserve terminal pixel dimensions and Kitty OSC 133 compatibility
       git add <resolved-files>
       git rebase --continue
       just finish-update NEW
@@ -84,7 +84,7 @@ finish-update new_release:
     just patch-finish "{{ new_release }}"
     just patch-target
 
-# Show only the intentionally patched upstream source file.
+# Show the primary patched runtime source; filter implementation lives in kitty_osc133.rs.
 patch-target:
     #!/usr/bin/env bash
     set -euo pipefail
