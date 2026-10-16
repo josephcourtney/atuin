@@ -82,14 +82,16 @@ enum Error {
 }
 
 fn run(options: RuntimeOptions) -> Result<(), Error> {
-    let (cols, rows) = terminal::size()?;
+    let window_size = terminal::window_size()?;
+    let rows = window_size.rows;
+    let cols = window_size.columns;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width: window_size.width,
+            pixel_height: window_size.height,
         })
         .map_err(|e| Error::OpenPty(e.into()))?;
 
@@ -255,12 +257,14 @@ fn spawn_resize_handler(
 
     std::thread::spawn(move || {
         for _ in signals.forever() {
-            if let Ok((cols, rows)) = terminal::size() {
+            if let Ok(window_size) = terminal::window_size() {
+                let rows = window_size.rows;
+                let cols = window_size.columns;
                 let _ = master.resize(PtySize {
                     rows,
                     cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
+                    pixel_width: window_size.width,
+                    pixel_height: window_size.height,
                 });
                 let _ = resize_tx.send(Msg::Resize { rows, cols });
             }
