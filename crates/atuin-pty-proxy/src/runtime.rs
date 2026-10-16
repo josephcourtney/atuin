@@ -82,14 +82,16 @@ enum Error {
 }
 
 fn run(options: RuntimeOptions) -> Result<(), Error> {
-    let (cols, rows) = terminal::size()?;
+    let window_size = terminal::window_size()?;
+    let rows = window_size.rows;
+    let cols = window_size.columns;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width: window_size.width,
+            pixel_height: window_size.height,
         })
         .map_err(|e| Error::OpenPty(e.into()))?;
 
@@ -120,6 +122,13 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
         })
         .ok();
 
+    crate::diagnostics::event(
+        "proxy_start",
+        format_args!(
+            "protocol={PROTOCOL_VERSION} capture_enabled={}",
+            options.command_capture.is_some()
+        ),
+    );
     let (msg_tx, msg_rx) = mpsc::sync_channel::<Msg>(64);
     let _parser_handle = screen::spawn_parser_thread(rows, cols, msg_rx, screen::ParserOptions {
         command_capture: options.command_capture,
@@ -183,7 +192,12 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let raw_data = &buf[..n];
-                    let _ = msg_tx.send(Msg::Data(raw_data.to_vec()));
+                    if crate::diagnostics::enabled() {
+                        crate::diagnostics::event("pty_read", format_args!("bytes={n}"));
+                    }
+                    if msg_tx.send(Msg::Data(raw_data.to_vec())).is_err() {
+                        crate::diagnostics::event("parser_queue_error", "receiver_disconnected");
+                    }
                     cwd_updater.update();
 
                     let highlighted;
@@ -255,12 +269,14 @@ fn spawn_resize_handler(
 
     std::thread::spawn(move || {
         for _ in signals.forever() {
-            if let Ok((cols, rows)) = terminal::size() {
+            if let Ok(window_size) = terminal::window_size() {
+                let rows = window_size.rows;
+                let cols = window_size.columns;
                 let _ = master.resize(PtySize {
                     rows,
                     cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
+                    pixel_width: window_size.width,
+                    pixel_height: window_size.height,
                 });
                 let _ = resize_tx.send(Msg::Resize { rows, cols });
             }

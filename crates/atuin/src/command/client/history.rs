@@ -1,5 +1,6 @@
 use std::fmt::{self, Display};
 use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use atuin_client::database::{Sqlite, current_context};
@@ -423,7 +424,7 @@ fn make_starting_history(
         .author_opt(author)
         .author_kind_opt(author_kind)
         .intent_opt(intent.map(String::from))
-        .shell_opt(std::env::var("ATUIN_SHELL").ok())
+        .shell_opt(atuin_common::env::var("ATUIN_SHELL").ok())
         .build()
         .into();
 
@@ -451,7 +452,7 @@ async fn handle_end(
     db: &Sqlite,
     store: SqliteStore,
     history_store: HistoryStore,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     id: HistoryId,
     exit: i64,
     duration: Option<u64>,
@@ -500,7 +501,7 @@ async fn handle_end(
                 .connect()
                 .await?;
             let (_, downloaded) = session.keyed(&history_store.encryption_key).sync().await?;
-            Settings::save_sync_time().await?;
+            settings.save_sync_time().await?;
 
             crate::sync::build(settings, &store, db, Some(&downloaded)).await?;
         }
@@ -565,7 +566,7 @@ pub(super) async fn start_history_entry(
 
 #[instrument(level = "trace", skip_all, fields(id = %id, exit, duration = ?duration), err)]
 pub(super) async fn end_history_entry(
-    settings: &Settings,
+    settings: &Arc<Settings>,
     id: HistoryId,
     exit: i64,
     duration: Option<u64>,
@@ -590,7 +591,7 @@ pub(super) async fn end_history_entry(
 
     let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
         .context("could not load or generate encryption key")?;
-    let host_id = Settings::host_id().await?;
+    let host_id = settings.host_id().await?;
     let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
     handle_end(&db, store, history_store, settings, id, exit, duration).await
@@ -632,7 +633,7 @@ pub(super) async fn delete_history_entries(
 /// ever on here.
 #[cfg(feature = "octavo")]
 async fn queue_octavo_deletions(settings: &Settings, ids: Vec<HistoryId>) {
-    let path = Settings::octavo_queue_path();
+    let path = settings.octavo_queue_path();
     if !path.exists() {
         return;
     }
@@ -1048,7 +1049,7 @@ impl Cmd {
         } else {
             let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
                 .context("could not load or generate encryption key")?;
-            let host_id = Settings::host_id().await?;
+            let host_id = settings.host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in &matches {
@@ -1100,7 +1101,7 @@ impl Cmd {
         } else {
             let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
                 .context("could not load or generate encryption key")?;
-            let host_id = Settings::host_id().await?;
+            let host_id = settings.host_id().await?;
             let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
             for entry in &matches {
@@ -1114,7 +1115,7 @@ impl Cmd {
 
     #[allow(clippy::too_many_lines)]
     #[instrument(level = "trace", skip_all, err)]
-    pub async fn run(self, settings: &Settings) -> Result<()> {
+    pub async fn run(self, settings: &Arc<Settings>) -> Result<()> {
         match self {
             Self::Start {
                 cmd_env,
@@ -1125,7 +1126,7 @@ impl Cmd {
                 ..
             } => {
                 let command = if cmd_env {
-                    std::env::var("ATUIN_COMMAND_LINE").unwrap_or_default()
+                    atuin_common::env::var("ATUIN_COMMAND_LINE").unwrap_or_default()
                 } else {
                     command.join(" ")
                 };
@@ -1157,7 +1158,7 @@ impl Cmd {
                 bail!("`atuin history tail` requires Atuin to be built with the `daemon` feature");
             }
             cmd => {
-                let context = current_context().await?;
+                let context = current_context(settings).await?;
 
                 let db_path = &settings.db_path;
                 let record_store_path = &settings.record_store_path;
@@ -1168,7 +1169,7 @@ impl Cmd {
                 let encryption_key = paseto_v4::Key::try_load_or_generate(&settings.key_path)
                     .context("could not load or generate encryption key")?;
 
-                let host_id = Settings::host_id().await?;
+                let host_id = settings.host_id().await?;
                 let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
                 match cmd {
@@ -1215,7 +1216,7 @@ impl Cmd {
                         Ok(())
                     }
 
-                    Self::InitStore => history_store.init_store(&db).await,
+                    Self::InitStore => history_store.init_store(&db, settings).await,
 
                     Self::Prune { dry_run } => {
                         Self::handle_prune(&db, settings, store, context, dry_run).await

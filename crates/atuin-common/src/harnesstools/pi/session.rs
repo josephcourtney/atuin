@@ -28,6 +28,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
 use typed_builder::TypedBuilder;
 
+use crate::env::var_nonempty;
 use crate::fs::tree_watcher::{FileStat, TreeWatcher};
 use crate::harnesstools::pi::{Pi, agent_dir, expand_tilde};
 use crate::harnesstools::session::model::{
@@ -36,12 +37,12 @@ use crate::harnesstools::session::model::{
 };
 use crate::harnesstools::session::{
     Checkpoint, FilePatch, Listener, Message, MessageError, Observable, Patch, RuntimeError,
-    Session, SessionId, Sessions, WatchError, scan_sessions,
+    Session, SessionId, Sessions, WatchError, modified_after, scan_sessions,
 };
 use crate::io::{FollowLines, Line, PathLineReader, PooledReadLines};
 use crate::json::jsonl::JsonlExt;
+use crate::path::PathBufExt as _;
 use crate::sync::BlockingPool;
-use crate::utils::env_nonempty;
 
 /// How far into a file the header line is looked for, like pi's own bounded header scan
 /// (session-manager.ts `MAX_SESSION_HEADER_SCAN_BYTES`).
@@ -66,7 +67,7 @@ impl PiSessions {
 
 /// Where pi keeps sessions by default (see [`session_root`]).
 pub(crate) fn default_root() -> PathBuf {
-    session_root(&agent_dir(), env_nonempty("PI_CODING_AGENT_SESSION_DIR").as_deref())
+    session_root(&agent_dir(), var_nonempty("PI_CODING_AGENT_SESSION_DIR").as_deref())
 }
 
 /// The file of session `id` under `root`. Pi names it `<timestamp>_<id>.jsonl`, so a file so
@@ -105,11 +106,11 @@ fn custom_session_dir(agent_dir: &Path, env: Option<&std::ffi::OsStr>) -> Option
 /// `session-manager.ts` `getDefaultSessionDirPath`).
 pub(crate) fn new_session_dir(cwd: &Path) -> PathBuf {
     let agent_dir = agent_dir();
-    let env = env_nonempty("PI_CODING_AGENT_SESSION_DIR");
+    let env = var_nonempty("PI_CODING_AGENT_SESSION_DIR");
     custom_session_dir(&agent_dir, env.as_deref()).unwrap_or_else(|| {
         let cwd = cwd.to_string_lossy();
         let cwd = cwd.strip_prefix(['/', '\\']).unwrap_or(&cwd).replace(['/', '\\', ':'], "-");
-        agent_dir.join("sessions").join(format!("--{cwd}--"))
+        agent_dir.joined("sessions").joined(format!("--{cwd}--"))
     })
 }
 
@@ -498,6 +499,11 @@ impl Session for PiSession {
                 let (dir, pool) = (dir.clone(), pool.clone());
                 async move { Ok(resolve_parent(message, dir.as_deref(), &pool).await) }
             })
+    }
+
+    async fn changed_after(mut self, since: std::time::SystemTime) -> Option<Self> {
+        modified_after(self.changes.as_mut(), since).await?;
+        Some(self)
     }
 }
 
@@ -1151,7 +1157,7 @@ mod tests {
         let expected = expected
             .replace("<abs>", abs)
             .replace("<agent>", &agent.path().to_string_lossy())
-            .replace("<home>", &crate::utils::home_dir().to_string_lossy());
+            .replace("<home>", &crate::dirs::home_dir().to_string_lossy());
         assert_eq!(
             session_root(agent.path(), env.map(std::ffi::OsStr::new)),
             PathBuf::from(expected)
@@ -1198,7 +1204,7 @@ mod tests {
         let sub = dir.path().join("--proj--");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(
-            sub.join("1700000000_s1.jsonl"),
+            sub.joined("1700000000_s1.jsonl"),
             serde_json::json!({"type": "session", "id": "s1"}).to_string(),
         )
         .unwrap();
@@ -1323,12 +1329,12 @@ mod tests {
         let header = |id: &str| serde_json::json!({"type": "session", "id": id}).to_string() + "\n";
         std::fs::write(dir.path().join("1_a.jsonl"), header("a")).unwrap();
         std::fs::create_dir(dir.path().join("nested")).unwrap();
-        std::fs::write(dir.path().join("nested").join("2_b.jsonl"), header("b")).unwrap();
+        std::fs::write(dir.path().join("nested").joined("2_b.jsonl"), header("b")).unwrap();
         std::fs::write(dir.path().join("ignore.txt"), header("c")).unwrap();
         // pi-subagents' default event log, beside the sessions: no header, no session.
         std::fs::create_dir(dir.path().join("subagent-artifacts")).unwrap();
         std::fs::write(
-            dir.path().join("subagent-artifacts").join("run1_worker_0.jsonl"),
+            dir.path().join("subagent-artifacts").joined("run1_worker_0.jsonl"),
             b"{\"type\":\"agent_start\"}\n",
         )
         .unwrap();

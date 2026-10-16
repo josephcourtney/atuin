@@ -192,16 +192,24 @@ impl<'data> EventChunks<'_, 'data> {
 
 /// Try to parse an OSC sequence's parameters as an Atuin marker.
 fn parse_marker(params: &[u8]) -> Option<Event> {
-    let [kind, b';', rest @ ..] = params.strip_prefix(MARKER_PREFIX)? else {
+    let params = params.strip_prefix(MARKER_PREFIX)?;
+    let [kind, b';', rest @ ..] = params else {
+        crate::diagnostics::event("marker_rejected", "malformed_fields");
         return None;
     };
-
-    let rest_as_history_id = || std::str::from_utf8(rest).ok()?.parse::<HistoryId>().ok();
-
+    if *kind != b'C' && *kind != b'D' {
+        crate::diagnostics::event("marker_rejected", "unknown_kind");
+        return None;
+    }
+    let Some(history_id) = std::str::from_utf8(rest).ok().and_then(|s| s.parse::<HistoryId>().ok())
+    else {
+        crate::diagnostics::event("marker_rejected", "invalid_history_id");
+        return None;
+    };
     match kind {
-        b'C' => Some(Event::OutputStart(rest_as_history_id()?)),
-        b'D' => Some(Event::OutputEnd(rest_as_history_id()?)),
-        _ => None,
+        b'C' => Some(Event::OutputStart(history_id)),
+        b'D' => Some(Event::OutputEnd(history_id)),
+        _ => unreachable!(),
     }
 }
 
@@ -343,6 +351,19 @@ mod tests {
     }
 
     // -- Basic event detection ------------------------------------------------
+
+    #[test]
+    fn rejects_invalid_and_legacy_markers_without_fabricating_events() {
+        let invalid = [
+            format!("\x1b]18188735;C;not-a-uuid\x07"),
+            format!("\x1b]18188735;X;{HID}\x07"),
+            "\x1b]18188735;C\x07".to_owned(),
+            format!("\x1b]133;D;0;history_id={HID}\x07"),
+        ];
+        for marker in invalid {
+            assert!(parse_events(marker.as_bytes()).is_empty(), "{marker:?}");
+        }
+    }
 
     #[rstest]
     #[case::start("C", Event::OutputStart(hid(HID)))]

@@ -15,9 +15,9 @@ use crate::grpc::ai::session::pb::ai_session_server::AiSession as GrpcService;
 use crate::grpc::ai::session::pb::{
     GetSessionEvent, GetSessionRequest, HarnessFilterRequest, ImportSessionsEvent,
     ImportSessionsProgress, ImportSessionsRequest, ImportSessionsSummary, ListSessionsRequest,
-    RebuildSessionsReply, RebuildSessionsRequest, SearchSessionsMatch, SearchSessionsRequest,
-    SessionRefRequest, TailSessionsEvent, TailSessionsRequest, get_session_event,
-    import_sessions_event, tail_sessions_event,
+    ProjectSyncedReply, ProjectSyncedRequest, RebuildSessionsReply, RebuildSessionsRequest,
+    SearchSessionsMatch, SearchSessionsRequest, SessionRefRequest, TailSessionsEvent,
+    TailSessionsRequest, get_session_event, import_sessions_event, tail_sessions_event,
 };
 use crate::grpc::common::pb as common;
 use crate::grpc::common::pb::Lagged;
@@ -54,8 +54,8 @@ const REBUILDING_METADATA: &str = "atuin-ai-sessions-rebuilding";
 
 fn rebuilding_status((replayed, pending): (u64, u64)) -> Status {
     let mut status = Status::unavailable(format!(
-        "AI sessions are being rebuilt from the record store ({replayed} of {pending} records); \
-         try again shortly"
+        "Threads are being rebuilt from the record store ({replayed} of {pending} records); try \
+         again shortly"
     ));
     let progress = MetadataValue::try_from(format!("{replayed}/{pending}"))
         .expect("digits and a slash are valid metadata");
@@ -231,6 +231,14 @@ impl GrpcService for Service {
         }
     }
 
+    async fn project_synced(
+        &self,
+        _request: Request<ProjectSyncedRequest>,
+    ) -> Result<Response<ProjectSyncedReply>, Status> {
+        self.capture.project_synced().await;
+        Ok(Response::new(ProjectSyncedReply {}))
+    }
+
     async fn import_sessions(
         &self,
         request: Request<ImportSessionsRequest>,
@@ -240,7 +248,7 @@ impl GrpcService for Service {
         // the caller sees it is unavailable.
         if !self.capture.is_available() {
             return Err(Status::failed_precondition(
-                "AI session capture is unavailable: the session store failed to open or recover",
+                "Thread capture is unavailable: the threads store failed to open or recover",
             ));
         }
 

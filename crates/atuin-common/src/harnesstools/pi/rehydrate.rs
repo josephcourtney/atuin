@@ -17,11 +17,11 @@
 //!   content and are skipped, so pi starts on its configured thinking level; the model is named
 //!   by each assistant turn, its provider guessed from the model's name, and pi falls back to its
 //!   default model when it can't use it. A system-role text entry is skipped too.
-//! - **Tool calls captured without their input** (`ai.capture_tools` off, or a policy withheld
+//! - **Tool calls captured without their input** (`threads.capture_tools` off, or a policy withheld
 //!   it): pi-ai sends a `toolCall` without `arguments` as an empty input to Anthropic and as
 //!   `"null"` to OpenAI, a call on nothing either way, so each becomes a note in its turn's text
 //!   (`[ran a shell command]`; see [`tool_note`](crate::harnesstools::note::tool_note)) and its
-//!   `toolResult` is dropped. The run of assistant messages the dropped results stood between is merged into its first one, so the
+//!   `toolResult` is dropped. The run of assistant messages the dropped results stood between is merged into its last one, so the
 //!   turns still alternate ([`Flatten::Runs`]). Re-captured, that entry keeps its id (capture
 //!   already holds it: nothing is pushed), and the entries merged away and the results are not
 //!   there to capture again. The entry records which synced rows went into it
@@ -35,6 +35,8 @@
 //! - A `!command` keeps its command, output and whether it failed, not its exit code; one from a
 //!   v1 file (no entry ids) has its result renamed after the id it is written under.
 //! - The title is written as a `session_info` entry, under the id of the row that set it.
+//!
+//! [`Flatten::Runs`]: crate::harnesstools::rehydrate::Flatten::Runs
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,8 +47,8 @@ use time::macros::format_description;
 
 use super::session::{default_root, locate, new_session_dir};
 use crate::harnesstools::rehydrate::{
-    Flatten, RehydrateError, RehydrateMessage, RehydrateSession, UNCAPTURED_OUTPUT,
-    break_line_cycles, flatten_uncaptured_calls, on_parent_cycles, record_merged,
+    RehydrateError, RehydrateMessage, RehydrateSession, UNCAPTURED_OUTPUT, break_line_cycles,
+    merge_uncaptured_runs, on_parent_cycles, record_merged,
 };
 use crate::harnesstools::resume;
 use crate::harnesstools::session::{Content, Patch, Role, StopReason, ToolResult, Usage, patch};
@@ -145,13 +147,16 @@ pub(crate) struct Continuing<'a> {
 /// ([`Flatten::Runs`]), and its title when `title`: for a whole session, or for rows appended to
 /// the file `continuing` describes. The rows written as no entry of their own are recorded on the
 /// entries they went into ([`MERGED_FIELD`](crate::harnesstools::rehydrate::MERGED_FIELD)).
+///
+/// [`Flatten::Runs`]: crate::harnesstools::rehydrate::Flatten::Runs
 pub(crate) fn lines(
     session: &RehydrateSession,
     continuing: &Continuing<'_>,
     title: bool,
 ) -> Vec<Value> {
+    let (messages, hosts) = merge_uncaptured_runs(&session.messages);
     let session = &RehydrateSession {
-        messages: flatten_uncaptured_calls(&session.messages, &Flatten::Runs),
+        messages,
         ..session.clone()
     };
     let mut writer = Writer::new(session, continuing);
@@ -163,6 +168,11 @@ pub(crate) fn lines(
     }
     let mut lines = writer.lines;
     break_line_cycles(&mut lines, "id", &["parentId"]);
+    for (row, into) in &mut writer.merged {
+        if let Some(host) = hosts.get(row) {
+            into.clone_from(host);
+        }
+    }
     record_merged(&mut lines, &writer.merged, |l| l["id"].as_str().map(str::to_owned));
     lines
 }

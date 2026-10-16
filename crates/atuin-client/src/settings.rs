@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use atuin_common::logs::LogLevel;
@@ -30,28 +30,24 @@ use url::Url;
 
 static EXAMPLE_CONFIG: &str = include_str!("../config.toml");
 
-static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-static META_CONFIG: OnceLock<(String, f64)> = OnceLock::new();
-static META_STORE: OnceCell<crate::meta::MetaStore> = OnceCell::const_new();
-
-pub mod ai_sessions;
 pub mod daemon;
 pub mod disk_usage_limit;
 mod kv;
-pub(crate) mod meta;
+pub mod meta;
 pub mod output;
 mod scripts;
 pub mod security;
 pub mod shells;
+pub mod threads;
 pub mod watcher;
 
-pub use ai_sessions::{AiSessionFilterMode, AiSessionResume, AiSessions};
 pub use daemon::Daemon;
 pub use disk_usage_limit::{DiskUsageLimit, DiskUsageLimitParseError};
 use output::OutputCaptureConfig;
 pub use output::{CaptureLimits, CommandFilter, OutputCapture};
 pub use security::Security;
 pub use shells::Shells;
+pub use threads::{AiSessionFilterMode, AiSessionResume, Threads};
 
 /// Default sync address for Atuin's hosted service, parsed once.
 pub static DEFAULT_SYNC_URL: LazyLock<Url> =
@@ -542,10 +538,10 @@ pub struct PtyProxy {
     pub enabled: bool,
 }
 
+#[cfg(feature = "octavo")]
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Octavo {
     pub enabled: bool,
-    pub endpoint: Option<Url>,
     /// Whether captured command output goes to Octavo too, while `enabled` and output capture are
     /// both on.
     pub upload_output: bool,
@@ -717,30 +713,6 @@ pub struct Ai {
 
     /// Whether the AI TUI surfaces feature tips. `None` = enabled.
     pub tips: Option<bool>,
-
-    /// Whether the daemon captures live AI harness sessions (Claude Code, Codex, ...) into the
-    /// synced record store. Off by default: capture copies the conversation (what was said, and
-    /// the tools called, see [`Self::capture_tools`]) into the encrypted store used by sync, so
-    /// it is strictly opt-in.
-    #[serde(default)]
-    pub capture_sessions: bool,
-
-    /// With [`Self::capture_sessions`], also capture what each tool call was given and what it
-    /// returned (commands and their output, files read and written), so a resumed session has
-    /// them too. On by default, with secrets redacted and each payload held to 64 KiB; off keeps
-    /// only each tool's name.
-    #[serde(default = "Ai::default_capture_tools")]
-    pub capture_tools: bool,
-
-    /// The `atuin ai resume` session picker (`[ai.sessions]`).
-    #[serde(default)]
-    pub sessions: AiSessions,
-}
-
-impl Ai {
-    const fn default_capture_tools() -> bool {
-        true
-    }
 }
 
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
@@ -1054,9 +1026,9 @@ impl Default for Ui {
 
 #[allow(deprecated)]
 #[serde_as]
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Settings {
-    pub data_dir: Option<String>,
+    pub data_dir: PathBuf,
     pub dialect: Dialect,
     pub timezone: UtcOffsetSpec,
     pub style: Style,
@@ -1159,6 +1131,7 @@ pub struct Settings {
     #[serde(default)]
     pub output: OutputCapture,
 
+    #[cfg(feature = "octavo")]
     #[serde(default)]
     pub octavo: Octavo,
 
@@ -1188,6 +1161,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub ai: Ai,
+
+    #[serde(default)]
+    pub threads: Threads,
 
     #[serde(default)]
     pub security: Security,
@@ -1229,95 +1205,90 @@ impl Settings {
             .unwrap_or_else(|| self.search_mode())
     }
 
-    /// The resolved data directory: a custom `data_dir` / `ATUIN_DATA_DIR` if one was configured
-    /// when settings were last built this process, otherwise [`atuin_common::utils::data_dir`].
-    #[must_use]
-    pub fn effective_data_dir() -> PathBuf {
-        DATA_DIR.get().cloned().unwrap_or_else(atuin_common::utils::data_dir)
-    }
-
-    /// Directory of the durable command-output capture store, under the [effective data
-    /// dir](Self::effective_data_dir). Unlike the sqlite stores this is a fjall database
-    /// directory, not a single file.
+    /// Directory of the durable command-output capture store, under the [data dir](Self::data_dir).
+    /// Unlike the sqlite stores this is a fjall database directory, not a single file.
     ///
     /// The user should not mess with this directory. Bad things can happen.
     #[must_use]
-    pub fn command_capture_dir() -> PathBuf {
-        Self::effective_data_dir().join("output-capture")
+    pub fn command_capture_dir(&self) -> PathBuf {
+        self.data_dir.join("output-capture")
     }
 
-    /// The AI harness session sidecar database, under the [effective data
-    /// dir](Self::effective_data_dir). The daemon owns and writes it; other readers open it
-    /// read-only (`AiSessionDatabase::open_read_only`).
+    /// The threads sidecar database, under the [data dir](Self::data_dir). The daemon owns and
+    /// writes it; other readers open it read-only (`AiSessionDatabase::open_read_only`).
     #[must_use]
-    pub fn ai_session_sidecar_path() -> PathBuf {
-        Self::effective_data_dir().join("ai_session_sidecar.db")
+    pub fn threads_db_path(&self) -> PathBuf {
+        self.data_dir.join("threads.db")
     }
 
+    #[cfg(feature = "octavo")]
     #[must_use]
-    pub fn octavo_queue_path() -> PathBuf {
-        Self::effective_data_dir().join("octavo.db")
+    pub fn octavo_queue_path(&self) -> PathBuf {
+        self.data_dir.join("octavo.db")
     }
 
     // -- Meta store: lazily initialized on first access --
 
-    pub async fn meta_store() -> Result<&'static crate::meta::MetaStore> {
+    /// Load the meta store.
+    ///
+    /// Note: there is one meta store per process. The first time this method is called, the meta
+    /// store will be initialized from the parameters in that [`Settings`] instance (most notably
+    /// [`meta.db_path`](meta::Settings::db_path)). All future calls to this method will return the
+    /// same [`MetaStore`](crate::meta::MetaStore), even if called on a different [`Settings`]
+    /// instance. This matches existing behavior.
+    pub async fn meta_store(&self) -> Result<&'static crate::meta::MetaStore> {
+        static META_STORE: OnceCell<crate::meta::MetaStore> = OnceCell::const_new();
+
         META_STORE
             .get_or_try_init(|| async {
-                let (db_path, timeout) = META_CONFIG.get().ok_or_else(|| {
-                    eyre!("meta store config not set — Settings::new() has not been called")
-                })?;
-                crate::meta::MetaStore::new(
-                    db_path,
-                    std::time::Duration::try_from_secs_f64(*timeout)?,
-                )
-                .await
+                crate::meta::MetaStore::new(&self.meta.db_path, &self.data_dir, self.local_timeout)
+                    .await
             })
             .await
     }
 
-    pub async fn host_id() -> Result<HostId> {
-        Self::meta_store().await?.host_id().await
+    pub async fn host_id(&self) -> Result<HostId> {
+        self.meta_store().await?.host_id().await
     }
 
-    pub async fn last_sync() -> Result<OffsetDateTime> {
-        Self::meta_store().await?.last_sync().await
+    pub async fn last_sync(&self) -> Result<OffsetDateTime> {
+        self.meta_store().await?.last_sync().await
     }
 
-    pub async fn save_sync_time() -> Result<()> {
-        Self::meta_store().await?.save_sync_time().await
+    pub async fn save_sync_time(&self) -> Result<()> {
+        self.meta_store().await?.save_sync_time().await
     }
 
-    pub async fn last_version_check() -> Result<OffsetDateTime> {
-        Self::meta_store().await?.last_version_check().await
+    pub async fn last_version_check(&self) -> Result<OffsetDateTime> {
+        self.meta_store().await?.last_version_check().await
     }
 
-    pub async fn save_version_check_time() -> Result<()> {
-        Self::meta_store().await?.save_version_check_time().await
+    pub async fn save_version_check_time(&self) -> Result<()> {
+        self.meta_store().await?.save_version_check_time().await
     }
 
     pub async fn should_sync(&self) -> Result<bool> {
-        if !self.auto_sync || !Self::meta_store().await?.logged_in().await? {
+        if !self.auto_sync || !self.meta_store().await?.logged_in().await? {
             return Ok(false);
         }
 
-        Ok(OffsetDateTime::now_utc() - Self::last_sync().await?
+        Ok(OffsetDateTime::now_utc() - self.last_sync().await?
             >= time::Duration::try_from(self.sync_frequency)?)
     }
 
     pub async fn logged_in(&self) -> Result<bool> {
-        Self::meta_store().await?.logged_in().await
+        self.meta_store().await?.logged_in().await
     }
 
     pub async fn session_token(&self) -> Result<SecretString> {
-        match Self::meta_store().await?.session_token().await? {
+        match self.meta_store().await?.session_token().await? {
             Some(token) => Ok(token),
             None => Err(eyre!("Tried to load session; not logged in")),
         }
     }
 
     pub async fn hub_session_token(&self) -> Result<SecretString> {
-        match Self::meta_store().await?.hub_session_token().await? {
+        match self.meta_store().await?.hub_session_token().await? {
             Some(token) => Ok(token),
             None => Err(eyre!("Tried to load hub session; not logged in")),
         }
@@ -1379,9 +1350,12 @@ impl Settings {
     #[cfg(feature = "sync")]
     #[must_use]
     pub async fn resolve_sync_auth(&self) -> SyncAuth {
-        let meta = match Self::meta_store().await {
+        let meta = match self.meta_store().await {
             Ok(m) => m,
             Err(e) => {
+                // Unlike not being logged in, a failure: callers tracing the result at debug
+                // would hide it.
+                tracing::warn!("failed to open the meta store for sync auth: {e}");
                 return SyncAuth::NotLoggedIn {
                     reason: format!("Failed to open meta store: {e}"),
                 };
@@ -1436,15 +1410,18 @@ impl Settings {
     /// Delegates to [`Self::resolve_sync_auth`] and converts the result to an
     /// `AuthToken`. Callers that need to distinguish between auth states
     /// (e.g. to show different UI) should call `resolve_sync_auth` directly.
+    ///
+    /// Not being logged in is an expected state (an offline daemon asks on every start), so the
+    /// error is traced at debug, and callers that fail on it report it themselves.
     #[cfg(feature = "sync")]
-    #[instrument(level = "trace", skip_all, err)]
+    #[instrument(level = "trace", skip_all, err(level = "debug"))]
     pub async fn sync_auth_token(&self) -> Result<crate::api_client::AuthToken> {
         self.resolve_sync_auth().await.into_auth_token()
     }
 
     #[cfg(feature = "check-update")]
     async fn needs_update_check(&self) -> Result<bool> {
-        let last_check = Self::last_version_check().await?;
+        let last_check = self.last_version_check().await?;
         let diff = OffsetDateTime::now_utc() - last_check;
 
         // Check a max of once per hour
@@ -1459,7 +1436,7 @@ impl Settings {
             Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version::new(100_000, 0, 0));
 
         if !self.needs_update_check().await? {
-            let meta = Self::meta_store().await?;
+            let meta = self.meta_store().await?;
             let version = match meta.latest_version().await? {
                 Some(v) => Version::parse(&v).unwrap_or(current),
                 None => current,
@@ -1474,8 +1451,8 @@ impl Settings {
         #[cfg(not(feature = "sync"))]
         let latest = current;
 
-        let meta = Self::meta_store().await?;
-        Self::save_version_check_time().await?;
+        let meta = self.meta_store().await?;
+        self.save_version_check_time().await?;
         meta.save_latest_version(&latest.to_string()).await?;
 
         Ok(latest)
@@ -1534,7 +1511,7 @@ impl Settings {
     }
 
     pub fn builder() -> Result<ConfigBuilder<DefaultState>> {
-        Ok(Self::builder_with_data_dir(&atuin_common::utils::data_dir())?)
+        Ok(Self::builder_with_data_dir(&atuin_common::dirs::unconfigured_data_dir())?)
     }
 
     fn builder_with_data_dir(
@@ -1546,15 +1523,16 @@ impl Settings {
         let scripts_path = data_dir.join("scripts.db");
         let ai_sessions_path = data_dir.join("ai_sessions.db");
         let pidfile_path = data_dir.join("atuin-daemon.pid");
-        let logs_dir = atuin_common::utils::logs_dir();
+        let logs_dir = atuin_common::dirs::logs_dir();
 
         let key_path = data_dir.join("key");
         let meta_path = data_dir.join("meta.db");
 
         let output = OutputCaptureConfig::default();
 
-        Ok(Config::builder()
+        let builder = Config::builder()
             .set_default("history_format", "{time}\t{command}\t{duration}")?
+            .set_default("data_dir", data_dir.to_str())?
             .set_default("db_path", db_path.to_str())?
             .set_default("record_store_path", record_store_path.to_str())?
             .set_default("key_path", key_path.to_str())?
@@ -1638,8 +1616,6 @@ impl Settings {
             .set_default("ai.db_path", ai_sessions_path.to_str())?
             .set_default("ai.session_continue_minutes", 60)?
             .set_default("ai.send_cwd", false)?
-            .set_default("ai.capture_sessions", false)?
-            .set_default("ai.capture_tools", true)?
             .set_default("ai.opening.send_cwd", false)?
             .set_default("ai.opening.send_last_command", false)?
             .set_default("ui.syntax_highlight", true)?
@@ -1658,34 +1634,26 @@ impl Settings {
             .set_default("tmux.height", "60%")?
             .set_default(
                 "prefers_reduced_motion",
-                std::env::var("NO_MOTION")
-                    .ok()
-                    .map(|_| config::Value::new(None, config::ValueKind::Boolean(true)))
-                    .unwrap_or_else(|| config::Value::new(None, config::ValueKind::Boolean(false))),
+                atuin_common::env::var_os("NO_MOTION").is_some(),
             )?
             .set_default("no_mouse", false)?
-            .set_default("pty_proxy.enabled", false)?
+            .set_default("pty_proxy.enabled", false)?;
+        #[cfg(feature = "octavo")]
+        let builder = builder
             .set_default("octavo.enabled", false)?
-            .set_default("octavo.endpoint", None::<String>)?
-            .set_default("octavo.upload_output", false)?
+            .set_default("octavo.upload_output", false)?;
+
+        Ok(builder
             .add_source(Environment::with_prefix("atuin").prefix_separator("_").separator("__")))
     }
 
     pub fn get_config_path() -> Result<PathBuf> {
-        let config_dir = atuin_common::utils::config_dir();
+        let config_file = atuin_common::dirs::config_path("config.toml");
 
-        create_dir_all(&config_dir)
-            .wrap_err_with(|| format!("could not create dir {config_dir:?}"))?;
-
-        let mut config_file = if let Ok(p) = std::env::var("ATUIN_CONFIG_DIR") {
-            PathBuf::from(p)
-        } else {
-            let mut config_file = PathBuf::new();
-            config_file.push(config_dir);
-            config_file
-        };
-
-        config_file.push("config.toml");
+        if let Some(config_dir) = config_file.parent() {
+            create_dir_all(config_dir)
+                .wrap_err_with(|| format!("could not create dir {config_dir:?}"))?;
+        }
 
         Ok(config_file)
     }
@@ -1724,35 +1692,44 @@ impl Settings {
                         .map_err(|e| eyre!("failed to expand data_dir path: {}", e))?;
                     PathBuf::from(expanded.as_ref())
                 }
-                None => atuin_common::utils::data_dir(),
+                None => atuin_common::dirs::unconfigured_data_dir(),
             }
         } else {
-            atuin_common::utils::data_dir()
+            atuin_common::dirs::unconfigured_data_dir()
         };
-
-        DATA_DIR.set(effective_data_dir.clone()).ok();
 
         create_dir_all(&effective_data_dir)
             .wrap_err_with(|| format!("could not create dir {effective_data_dir:?}"))?;
 
-        let mut config_builder = Self::builder_with_data_dir(&effective_data_dir)?;
+        let config_builder = Self::builder_with_data_dir(&effective_data_dir)?;
 
-        config_builder = if config_file.exists() {
+        let config_builder = if config_file.exists() {
             let config_file_str =
                 config_file.to_str().ok_or_else(|| eyre!("config file path is not valid UTF-8"))?;
             config_builder.add_source(ConfigFile::new(config_file_str, FileFormat::Toml))
         } else {
-            let mut file = File::create(config_file).wrap_err("could not create config file")?;
-            file.write_all(EXAMPLE_CONFIG.as_bytes())
-                .wrap_err("could not write default config file")?;
+            // Use `create_new` to avoid overwriting the file if it just got created in between our
+            // existence check and now.
+            match File::create_new(&config_file) {
+                Ok(mut file) => file
+                    .write_all(EXAMPLE_CONFIG.as_bytes())
+                    .wrap_err("could not write default config file")?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err).wrap_err("could not create config file"),
+            }
 
             config_builder
         };
 
+        // Explicitly set `data_dir` here to ensure it matches the `effective_data_dir` we just
+        // calculated.
+        let config_builder =
+            config_builder.set_override("data_dir", effective_data_dir.to_str())?;
+
         // all paths should be expanded
         let built = config_builder.build_cloned()?;
 
-        config_builder = [
+        let config_builder = [
             "db_path",
             "record_store_path",
             "key_path",
@@ -1761,6 +1738,7 @@ impl Settings {
             "logs.dir",
             "logs.search.file",
             "logs.daemon.file",
+            "logs.ai.file",
         ]
         .iter()
         .map(|key| (key, built.get_string(key).unwrap_or_default()))
@@ -1780,7 +1758,47 @@ impl Settings {
                 .unwrap_or_else(|_| panic!("failed to set absolute path override for {key}"))
         });
 
-        config_builder.build().map_err(Into::into)
+        Ok(Self::with_legacy_threads(config_builder.build()?)?)
+    }
+
+    /// `[threads]` was `ai.capture_sessions`, `ai.capture_tools` and `[ai.sessions]`: read them
+    /// as `threads.capture`, `threads.capture_tools` and `threads.*`, for any key `[threads]`
+    /// doesn't set itself. The defaults are set here, under them, so they never hide a legacy
+    /// value.
+    fn with_legacy_threads(config: Config) -> Result<Config, config::ConfigError> {
+        fn leaves(prefix: String, value: config::Value, out: &mut Vec<(String, config::Value)>) {
+            match value.kind {
+                config::ValueKind::Table(table) => {
+                    for (key, value) in table {
+                        leaves(format!("{prefix}.{key}"), value, out);
+                    }
+                }
+                _ => out.push((prefix, value)),
+            }
+        }
+
+        let mut legacy = Vec::new();
+        for (old, new) in [
+            ("ai.capture_sessions", "threads.capture"),
+            ("ai.capture_tools", "threads.capture_tools"),
+            ("ai.sessions", "threads"),
+        ] {
+            if let Ok(value) = config.get::<config::Value>(old) {
+                leaves(new.to_string(), value, &mut legacy);
+            }
+        }
+        legacy.retain(|(key, _)| config.get::<config::Value>(key).is_err());
+
+        legacy
+            .into_iter()
+            .try_fold(
+                Config::builder()
+                    .set_default("threads.capture", false)?
+                    .set_default("threads.capture_tools", true)?
+                    .add_source(config),
+                |builder, (key, value)| builder.set_override(key, value),
+            )?
+            .build()
     }
 
     /// Look up a single config value by dotted key (e.g. `"daemon.sync_frequency"`).
@@ -1875,9 +1893,6 @@ impl Settings {
         // Validate UI settings
         settings.ui.validate()?;
 
-        // Register meta store config for lazy initialization on first access
-        META_CONFIG.set((settings.meta.db_path.clone(), settings.local_timeout.as_secs_f64())).ok();
-
         Ok(settings)
     }
 
@@ -1905,12 +1920,14 @@ impl Settings {
 
     /// Check that a TOML string can be successfully deserialized into a [`Settings`] object.
     pub fn validate_str(toml: &str) -> Result<(), ValidationError> {
-        let config = Self::builder_with_data_dir(&atuin_common::utils::data_dir())?
-            .add_source(ConfigFile::from_str(toml, FileFormat::Toml))
-            .build()?;
+        let config = Self::with_legacy_threads(
+            Self::builder_with_data_dir(&atuin_common::dirs::unconfigured_data_dir())?
+                .add_source(ConfigFile::from_str(toml, FileFormat::Toml))
+                .build()?,
+        )?;
 
         let settings: Self = config.try_deserialize()?;
-        if let Some(dir) = &settings.data_dir {
+        if let Some(dir) = settings.data_dir.to_str() {
             shellexpand::full(dir).map_err(ValidationError::DataDir)?;
         }
 
@@ -1945,23 +1962,9 @@ pub enum ValidationError {
     DataDir(shellexpand::LookupError<std::env::VarError>),
 }
 
-/// Initialize the meta store configuration for testing.
-///
-/// This should only be used in tests. It allows tests to bypass the normal
-/// Settings::new() flow while still being able to use Settings::host_id()
-/// and other meta store dependent functions.
-///
-/// # Safety
-/// This function is not thread-safe with concurrent calls to Settings::new()
-/// or other meta store initialization. Only call from tests.
-#[doc(hidden)]
-pub fn init_meta_config_for_testing(meta_db_path: impl Into<String>, local_timeout: f64) {
-    META_CONFIG.set((meta_db_path.into(), local_timeout)).ok();
-}
-
 #[cfg(test)]
 pub(crate) fn test_local_timeout() -> Duration {
-    let secs = std::env::var("ATUIN_TEST_LOCAL_TIMEOUT")
+    let secs = atuin_common::env::var("ATUIN_TEST_LOCAL_TIMEOUT")
         .ok()
         .and_then(|x| x.parse::<f64>().ok())
         // this hardcoded value should be replaced by a simple way to get the
@@ -1972,6 +1975,7 @@ pub(crate) fn test_local_timeout() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::str::FromStr;
 
     use eyre::Result;
@@ -2075,6 +2079,7 @@ mod tests {
         let builder = super::Settings::builder_with_data_dir(&custom_dir)?;
         let config = builder.build()?;
 
+        let data_dir: String = config.get("data_dir")?;
         let db_path: String = config.get("db_path")?;
         let key_path: String = config.get("key_path")?;
         let record_store_path: String = config.get("record_store_path")?;
@@ -2085,6 +2090,7 @@ mod tests {
         let daemon_pidfile_path: String = config.get("daemon.pidfile_path")?;
         let daemon_autostart: bool = config.get("daemon.autostart")?;
 
+        assert_eq!(data_dir, custom_dir.to_str().unwrap());
         assert_eq!(db_path, custom_dir.join("history.db").to_str().unwrap());
         assert_eq!(key_path, custom_dir.join("key").to_str().unwrap());
         assert_eq!(record_store_path, custom_dir.join("records.db").to_str().unwrap());
@@ -2127,12 +2133,17 @@ mod tests {
     }
 
     #[rstest]
-    fn effective_data_dir_returns_default_when_not_set() {
-        let effective = super::Settings::effective_data_dir();
-        let default = atuin_common::utils::data_dir();
-
-        assert!(effective.to_str().is_some());
-        assert!(effective.ends_with("atuin") || effective == default);
+    #[case::configured("data_dir = \"/custom/data\"\n", "/custom/data")]
+    #[case::unset("", "/default/data")]
+    fn data_dir_prefers_the_configured_one(#[case] toml: &str, #[case] expected: &str) {
+        let settings: Settings = Settings::builder_with_data_dir(Path::new("/default/data"))
+            .unwrap()
+            .add_source(ConfigFile::from_str(toml, FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(settings.data_dir, Path::new(expected));
     }
 
     #[rstest]
@@ -2199,13 +2210,58 @@ mod tests {
 
     /// Deserialize a TOML string into a [`Settings`] object.
     fn parse_settings(toml: &str) -> Settings {
-        Settings::builder_with_data_dir(&atuin_common::utils::data_dir())
+        let config = Settings::builder_with_data_dir(&atuin_common::dirs::unconfigured_data_dir())
             .expect("could not build settings builder")
             .add_source(ConfigFile::from_str(toml, FileFormat::Toml))
             .build()
-            .expect("could not build config")
+            .expect("could not build config");
+        Settings::with_legacy_threads(config)
+            .expect("could not read legacy threads settings")
             .try_deserialize()
             .expect("could not deserialize config")
+    }
+
+    #[rstest]
+    fn threads_default_off_with_tools() {
+        let settings = parse_settings("");
+        assert!(!settings.threads.capture);
+        assert!(settings.threads.capture_tools);
+        assert!(settings.threads.resume_chooser);
+    }
+
+    #[rstest]
+    fn legacy_ai_session_settings_are_read_as_threads() {
+        let settings = parse_settings(
+            "[ai]\ncapture_sessions = true\ncapture_tools = \
+             false\n\n[ai.sessions]\nresume_chooser = false\n\n[ai.sessions.resume]\npi = \"pi \
+             --session {id}\"\n",
+        );
+        assert!(settings.threads.capture);
+        assert!(!settings.threads.capture_tools);
+        assert!(!settings.threads.resume_chooser);
+        assert_eq!(settings.threads.resume.pi.as_deref(), Some("pi --session {id}"));
+    }
+
+    #[rstest]
+    fn threads_settings_win_over_legacy_ones() {
+        let settings = parse_settings(
+            "[ai]\ncapture_sessions = true\n\n[ai.sessions]\ninline_height = 10\nmouse = \
+             false\n\n[ai.sessions.resume]\nclaude = \"old\"\npi = \"old\"\n\n[threads]\ncapture \
+             = false\ninline_height = 20\n\n[threads.resume]\npi = \"new\"\n",
+        );
+        assert!(!settings.threads.capture);
+        assert_eq!(settings.threads.inline_height, Some(20));
+        assert_eq!(settings.threads.mouse, Some(false));
+        assert_eq!(settings.threads.resume.claude.as_deref(), Some("old"));
+        assert_eq!(settings.threads.resume.pi.as_deref(), Some("new"));
+    }
+
+    /// `atuin config get --resolved` shows the defaults, as it did for `ai.capture_sessions`.
+    #[rstest]
+    fn threads_defaults_resolve() {
+        let config = Settings::with_legacy_threads(config::Config::default()).unwrap();
+        assert!(!config.get_bool("threads.capture").unwrap());
+        assert!(config.get_bool("threads.capture_tools").unwrap());
     }
 
     #[rstest]

@@ -1,7 +1,7 @@
-//! `atuin ai session` -- a client for the daemon's `ai.session.AiSession` service.
+//! `atuin threads` -- a client for the daemon's `ai.session.AiSession` service, and resume.
 //!
 //! Thin wrappers around [`AiClient`] plus rendering. Every subcommand resolves a selector to a
-//! session, calls the matching RPC, decodes what the daemon streams into the domain types, and
+//! thread, calls the matching RPC, decodes what the daemon streams into the domain types, and
 //! renders them either as human-readable text or as JSON/NDJSON for scripting.
 
 use std::borrow::Cow;
@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 
 use atuin_client::ai_session::{
-    HarnessKind, HarnessSession, Message, SearchTerms, Session, SessionFilter, SessionMatch,
+    AtuinSessionId, HarnessKind, HarnessSession, Message, SearchTerms, Session, SessionFilter,
+    SessionMatch,
 };
 use atuin_client::settings::Settings;
 use atuin_common::harnesstools::session::model::reasoning_label;
@@ -25,53 +26,78 @@ use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use time::OffsetDateTime;
 
+/// How a subcommand's output is rendered.
 #[derive(Args, Debug)]
-pub struct Cmd {
-    #[command(subcommand)]
-    cmd: SubCmd,
-
+pub struct Output {
     /// How output is rendered.
-    #[arg(long, value_enum, default_value_t = Style::Auto, global = true)]
+    #[arg(long, value_enum, default_value_t = Style::Auto)]
     style: Style,
 }
 
+/// `atuin threads`.
 #[derive(Subcommand, Debug)]
-enum SubCmd {
-    /// List captured sessions, newest first.
-    List,
-
-    /// Show a session and its messages. Accepts a session id or `latest`.
-    Show {
-        /// Session id (a unique prefix is enough), or `latest` for the most recently active session.
-        #[arg(value_name = "ID|latest")]
-        session: String,
+pub enum Cmd {
+    /// List captured threads, newest first.
+    List {
+        #[command(flatten)]
+        output: Output,
     },
 
-    #[command(about = "Full-text search across captured sessions, most relevant first.")]
+    /// Show a thread and its messages. Accepts an id, a harness id or `latest`.
+    Show {
+        /// Id (its last 8 digits, as `list` shows them, are enough) or harness id (a unique prefix
+        /// is enough), or `latest` for the most recently active thread.
+        #[arg(value_name = "ID|latest")]
+        thread: String,
+
+        #[command(flatten)]
+        output: Output,
+    },
+
+    #[command(about = "Full-text search across captured threads, most relevant first.")]
     Search {
         #[arg(
             value_name = "QUERY",
-            help = "Words to look for in session titles, message text, reasoning, and tool calls"
+            allow_hyphen_values = true,
+            help = "Words to look for in thread titles, message text, reasoning, and tool calls"
         )]
         query: String,
-        #[arg(long, value_enum, help = "Only search sessions from this harness")]
+        #[arg(long, value_enum, help = "Only search threads from this harness")]
         harness: Option<HarnessArg>,
         #[arg(
             long,
             default_value_t = 10,
             value_name = "N",
-            help = "Maximum sessions to return; 0 for unbounded"
+            help = "Maximum threads to return; 0 for unbounded"
         )]
         limit: u32,
+
+        #[command(flatten)]
+        output: Output,
     },
 
-    /// Follow sessions and messages as they are recorded (until interrupted).
-    Tail,
+    /// Follow threads and messages as they are recorded (until interrupted).
+    Tail {
+        #[command(flatten)]
+        output: Output,
+    },
 
+    /// Import every thread the agents have on this machine, including those capture leaves
+    /// alone: the ones nobody has gone on with since it was turned on.
     Import {
+        /// Only import threads from this harness.
         #[arg(long, value_parser = parse_harness)]
         harness: Option<HarnessKind>,
+
+        #[command(flatten)]
+        output: Output,
     },
+
+    /// Pick a captured thread and resume it.
+    Resume(super::resume::Cmd),
+
+    /// Turn thread capture on (short for `atuin config enable threads`).
+    Enable,
 }
 
 // Only harnesses a capture path can actually produce are offered as filters (see AnyHarness);
@@ -124,27 +150,36 @@ impl Style {
     }
 }
 
-pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
-    if !settings.ai.capture_sessions {
+pub async fn run(cmd: Cmd, settings: Settings) -> Result<()> {
+    let style = match cmd {
+        Cmd::Resume(cmd) => return super::resume::run(cmd, settings).await,
+        // The atuin binary runs it as `atuin config enable threads`, which needs the daemon.
+        Cmd::Enable => return Err(eyre!("threads need the daemon, which this build leaves out")),
+        Cmd::List { ref output }
+        | Cmd::Show { ref output, .. }
+        | Cmd::Search { ref output, .. }
+        | Cmd::Tail { ref output }
+        | Cmd::Import { ref output, .. } => output.style.resolve(),
+    };
+
+    if !settings.threads.capture {
         // stderr so it never pollutes piped stdout (json/ndjson).
         eprintln!(
-            "note: AI session capture is off. Enable it with `ai.capture_sessions = true` in your \
-             atuin config to record new sessions."
+            "note: thread capture is off. Run `atuin config enable threads` to record new threads."
         );
     }
 
-    let style = cmd.style.resolve();
-    let mut client = AiClient::from_settings(settings).await?;
+    let mut client = AiClient::from_settings(&settings).await?;
 
     // Right after the daemon starts, and when a store command asks it to, it rebuilds its AI
     // sessions and refuses reads until done, rather than answer from a partial set. Tail only
     // streams what happens from now on.
-    if !matches!(cmd.cmd, SubCmd::Tail) {
+    if !matches!(cmd, Cmd::Tail { .. }) {
         let mut reported = None;
         client
             .wait_for_sessions(|progress| {
                 if reported.is_none() {
-                    eprintln!("AI sessions are being rebuilt from the record store; waiting...");
+                    eprintln!("Threads are being rebuilt from the record store; waiting...");
                 }
                 let (replayed, pending) = progress;
                 if reported != Some(progress) && pending > 0 {
@@ -155,19 +190,21 @@ pub async fn run(cmd: Cmd, settings: &Settings) -> Result<()> {
             .await?;
     }
 
-    let result = match cmd.cmd {
-        SubCmd::List => list(&mut client, style).await,
-        SubCmd::Show { session } => show(&mut client, &session, style).await,
-        SubCmd::Search {
+    let result = match cmd {
+        Cmd::List { .. } => list(&mut client, style).await,
+        Cmd::Show { thread, .. } => show(&mut client, &thread, style).await,
+        Cmd::Search {
             query,
             harness,
             limit,
+            ..
         } => search(&mut client, &query, harness.map(HarnessKind::from), limit, style).await,
-        SubCmd::Tail => tail(&mut client, style).await,
-        SubCmd::Import { harness } => import(&mut client, harness, style).await,
+        Cmd::Tail { .. } => tail(&mut client, style).await,
+        Cmd::Import { harness, .. } => import(&mut client, harness, style, &mut io::stdout()).await,
+        Cmd::Resume(_) | Cmd::Enable => unreachable!("returned above"),
     };
 
-    // A downstream reader that closes the pipe (e.g. `atuin ai session list | head`) makes the next
+    // A downstream reader that closes the pipe (e.g. `atuin threads list | head`) makes the next
     // write fail with BrokenPipe. That's a clean end of output, not an error, so swallow it rather
     // than print a scary message and exit non-zero.
     match result {
@@ -213,19 +250,15 @@ async fn list(client: &mut AiClient, style: Style) -> Result<()> {
         }
         _ => {
             if sessions.is_empty() {
-                writeln!(out, "No sessions captured yet.")?;
+                writeln!(out, "No threads captured yet.")?;
                 return Ok(());
             }
-            writeln!(
-                out,
-                "{:<14} {:<12} {:<16} {:>5}  TITLE",
-                "SESSION", "HARNESS", "UPDATED", "MSGS"
-            )?;
+            writeln!(out, "{:<8} {:<12} {:<16} {:>5}  TITLE", "ID", "HARNESS", "UPDATED", "MSGS")?;
             for s in &sessions {
                 writeln!(
                     out,
-                    "{:<14} {:<12} {:<16} {:>5}  {}",
-                    short_id(s.handle.session.as_ref()),
+                    "{:<8} {:<12} {:<16} {:>5}  {}",
+                    s.atuin_id.short(),
                     harness_name(s.handle.harness),
                     age(s.updated_at),
                     s.message_count,
@@ -314,10 +347,10 @@ async fn search(
         }
         _ => {
             if matches.is_empty() {
-                writeln!(out, "No sessions matched `{query}`.")?;
+                writeln!(out, "No threads matched `{query}`.")?;
                 return Ok(());
             }
-            writeln!(out, "{:<14} {:<12} {:<16}  MATCH", "SESSION", "HARNESS", "UPDATED")?;
+            writeln!(out, "{:<8} {:<12} {:<16}  MATCH", "ID", "HARNESS", "UPDATED")?;
             for m in &matches {
                 let title = m.title.to_plain().text;
                 let label = if title.trim().is_empty() {
@@ -327,8 +360,8 @@ async fn search(
                 };
                 writeln!(
                     out,
-                    "{:<14} {:<12} {:<16}  {}",
-                    short_id(m.session.handle.session.as_ref()),
+                    "{:<8} {:<12} {:<16}  {}",
+                    m.session.atuin_id.short(),
                     harness_name(m.session.handle.harness),
                     age(m.session.updated_at),
                     one_line(&label, 80),
@@ -353,7 +386,7 @@ async fn tail(client: &mut AiClient, style: Style) -> Result<()> {
     let mut active: Option<HarnessSession> = None;
 
     // Color only in the pretty (terminal) view, and never when NO_COLOR is set.
-    let color = matches!(style, Style::Pretty) && std::env::var_os("NO_COLOR").is_none();
+    let color = matches!(style, Style::Pretty) && atuin_common::env::var_os("NO_COLOR").is_none();
 
     while let Some(event) = stream.next().await {
         let Some(event) = event?.event else {
@@ -434,16 +467,50 @@ async fn tail(client: &mut AiClient, style: Style) -> Result<()> {
     Ok(())
 }
 
-async fn import(client: &mut AiClient, harness: Option<HarnessKind>, style: Style) -> Result<()> {
+/// Import every agent's sessions on this machine through the daemon, its progress on `out`: one
+/// line rewritten when `live` (a terminal), a line per session otherwise.
+pub async fn import_all(
+    settings: &Settings,
+    out: &mut (dyn Write + Send),
+    live: bool,
+) -> Result<()> {
+    let mut client = AiClient::from_settings(settings).await?;
+    // A daemon just started rebuilds its sessions first, and refuses an import until done.
+    client.wait_for_sessions(|_| {}).await?;
+    let style = if live {
+        Style::Pretty
+    } else {
+        Style::Plain
+    };
+    import(&mut client, None, style, out).await
+}
+
+async fn import(
+    client: &mut AiClient,
+    harness: Option<HarnessKind>,
+    style: Style,
+    out: &mut (dyn Write + Send),
+) -> Result<()> {
     let mut stream = client.import_sessions(harness).await?;
 
     // `--style json` is one document, so its per-session progress and final summary are collected
     // and written once at the end; `--style ndjson` and the human styles stream event by event.
     let mut json_sessions: Vec<serde_json::Value> = Vec::new();
     let mut json_summary: Option<serde_json::Value> = None;
+    let (mut sessions, mut imported, mut skipped) = (0u64, 0u64, 0u64);
 
     while let Some(event) = stream.next().await {
-        let Some(event) = event?.event else {
+        let event = match event {
+            Ok(event) => event,
+            Err(e) => {
+                if sessions > 0 && matches!(style, Style::Pretty) {
+                    // Finish the progress line so the error starts on its own.
+                    writeln!(out)?;
+                }
+                return Err(e.into());
+            }
+        };
+        let Some(event) = event.event else {
             continue;
         };
 
@@ -473,9 +540,7 @@ async fn import(client: &mut AiClient, harness: Option<HarnessKind>, style: Styl
                 }
                 _ => {
                     // ndjson: one value per line.
-                    let stdout = io::stdout();
-                    let mut out = stdout.lock();
-                    serde_json::to_writer(&mut out, &record)?;
+                    serde_json::to_writer(&mut *out, &record)?;
                     writeln!(out)?;
                     out.flush()?;
                 }
@@ -483,9 +548,20 @@ async fn import(client: &mut AiClient, harness: Option<HarnessKind>, style: Styl
             continue;
         }
 
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
         match &event {
+            // On a terminal, one line rewritten in place; otherwise a log line per session.
+            import_sessions_event::Event::Progress(p) if matches!(style, Style::Pretty) => {
+                sessions += 1;
+                imported += p.imported;
+                skipped += p.skipped;
+                write!(
+                    out,
+                    "\r\x1b[2Kimporting… {sessions} sessions, {imported} imported, {skipped} \
+                     skipped"
+                )?;
+                // Not a whole line, so stdout would hold it back.
+                out.flush()?;
+            }
             import_sessions_event::Event::Progress(p) => {
                 writeln!(
                     out,
@@ -497,9 +573,12 @@ async fn import(client: &mut AiClient, harness: Option<HarnessKind>, style: Styl
                 )?;
             }
             import_sessions_event::Event::Summary(s) => {
+                if matches!(style, Style::Pretty) {
+                    write!(out, "\r\x1b[2K")?;
+                }
                 writeln!(
                     out,
-                    "done: {} sessions, {} imported, {} skipped, {} failed",
+                    "done: {} threads, {} imported, {} skipped, {} failed",
                     s.sessions, s.imported, s.skipped, s.failed,
                 )?;
             }
@@ -509,9 +588,7 @@ async fn import(client: &mut AiClient, harness: Option<HarnessKind>, style: Styl
 
     if matches!(style, Style::Json) {
         let doc = serde_json::json!({ "sessions": json_sessions, "summary": json_summary });
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        serde_json::to_writer(&mut out, &doc)?;
+        serde_json::to_writer(&mut *out, &doc)?;
         writeln!(out)?;
     }
 
@@ -536,21 +613,27 @@ async fn resolve(client: &mut AiClient, selector: &str) -> Result<HarnessSession
         stream.try_collect().await?
     };
     select_session(sessions, selector).map_err(|e| match e {
-        SelectError::NotFound(_) => eyre!("{e}. Run `atuin ai session list`."),
+        SelectError::NotFound(_) => eyre!("{e}. Run `atuin threads list`."),
         e => eyre!(e),
     })
 }
 
 /// Why a selector matched no single session. Callers word the next step themselves: the CLI
-/// points at `atuin ai session list`, the MCP tool at its own list tool.
+/// points at `atuin threads list`, the MCP tool at its own list tool.
 #[derive(Debug, thiserror::Error)]
 pub enum SelectError {
-    #[error("no sessions captured yet")]
+    #[error("no threads captured yet")]
     NoSessions,
-    #[error("no session with id `{0}`")]
+    #[error("no thread with id `{0}`")]
     NotFound(String),
-    #[error("id `{0}` matches more than one session; use a longer or full id")]
+    #[error("id `{0}` matches more than one thread; use a longer or full id")]
     Ambiguous(String),
+    /// Several agents' sessions have the id (a session continued in another agent can keep it).
+    #[error("id `{id}` names a thread in more than one agent; use its id:{choices}")]
+    Shared {
+        id: String,
+        choices: String,
+    },
 }
 
 /// Pure selector logic, split out from the RPC so it can be tested directly.
@@ -563,52 +646,68 @@ pub fn select_session(
         return sessions.into_iter().next().map(|s| s.handle).ok_or(SelectError::NoSessions);
     }
 
-    // `list` prints ids truncated to 12 chars, so accept a unique id prefix as well as a full id.
-    let mut matches = sessions.into_iter().filter(|s| {
-        s.handle.session.as_ref().starts_with(selector) || s.atuin_id.has_prefix(selector)
-    });
-    let first = matches.next().ok_or_else(|| SelectError::NotFound(selector.to_owned()))?;
-    if matches.next().is_some() {
-        return Err(SelectError::Ambiguous(selector.to_owned()));
+    // Accept a unique prefix of either id, or the end of the atuin id, as well as a full one.
+    // An id given whole names its session, whatever longer ids it is a prefix of.
+    let atuin_id = selector.parse::<AtuinSessionId>().ok();
+    let (exact, prefixed): (Vec<Session>, Vec<Session>) = sessions
+        .into_iter()
+        .filter(|s| {
+            s.handle.session.as_ref().starts_with(selector)
+                || s.atuin_id.has_prefix(selector)
+                || s.atuin_id.has_suffix(selector)
+        })
+        .partition(|s| s.handle.session.as_ref() == selector || atuin_id == Some(s.atuin_id));
+    match (exact.as_slice(), prefixed.as_slice()) {
+        ([one], _) | ([], [one]) => Ok(one.handle.clone()),
+        ([], []) => Err(SelectError::NotFound(selector.to_owned())),
+        ([], _) => Err(SelectError::Ambiguous(selector.to_owned())),
+        (several, _) => Err(SelectError::Shared {
+            id: selector.to_owned(),
+            choices: several
+                .iter()
+                .map(|s| {
+                    format!("\n  {:<12} {}", harness_name(s.handle.harness), s.atuin_id.short())
+                })
+                .collect(),
+        }),
     }
-    Ok(first.handle)
 }
 
 // --- human rendering ----------------------------------------------------------------------------
 
 fn write_session_header(out: &mut dyn Write, s: &Session) -> io::Result<()> {
-    writeln!(out, "session   {}", sanitize(s.handle.session.as_ref()))?;
-    writeln!(out, "atuin id  {}", s.atuin_id)?;
-    writeln!(out, "harness   {}", harness_name(s.handle.harness))?;
+    writeln!(out, "id          {}", s.atuin_id)?;
+    writeln!(out, "harness id  {}", sanitize(s.handle.session.as_ref()))?;
+    writeln!(out, "harness     {}", harness_name(s.handle.harness))?;
     if let Some(title) = &s.title {
-        writeln!(out, "title     {}", sanitize(title))?;
+        writeln!(out, "title       {}", sanitize(title))?;
     }
     if let Some(cwd) = &s.cwd {
-        writeln!(out, "cwd       {}", sanitize(&cwd.to_string_lossy()))?;
+        writeln!(out, "cwd         {}", sanitize(&cwd.to_string_lossy()))?;
     }
     if let Some(branch) = &s.git_branch {
-        writeln!(out, "branch    {}", sanitize(branch))?;
+        writeln!(out, "branch      {}", sanitize(branch))?;
     }
     if let Some(model) = &s.model {
-        writeln!(out, "model     {}", sanitize(model))?;
+        writeln!(out, "model       {}", sanitize(model))?;
     }
-    // Links by atuin id, for the stored sessions they name.
+    // Links by id, for the stored sessions they name.
     if let Some(parent) = s.parent_atuin_id {
-        writeln!(out, "parent    {parent}")?;
+        writeln!(out, "parent      {parent}")?;
     }
     if let Some(root) = s.root_atuin_id {
-        writeln!(out, "root      {root}")?;
+        writeln!(out, "root        {root}")?;
     }
     if !s.child_atuin_ids.is_empty() {
         let children: Vec<String> = s.child_atuin_ids.iter().map(ToString::to_string).collect();
-        writeln!(out, "children  {}", children.join(", "))?;
+        writeln!(out, "children    {}", children.join(", "))?;
     }
-    writeln!(out, "started   {}", age(s.started_at))?;
-    writeln!(out, "updated   {}", age(s.updated_at))?;
-    writeln!(out, "messages  {}", s.message_count)?;
+    writeln!(out, "started     {}", age(s.started_at))?;
+    writeln!(out, "updated     {}", age(s.updated_at))?;
+    writeln!(out, "messages    {}", s.message_count)?;
     writeln!(
         out,
-        "tokens    in {} / out {} / cache {}+{}",
+        "tokens      in {} / out {} / cache {}+{}",
         s.usage.input.unwrap_or_default(),
         s.usage.output.unwrap_or_default(),
         s.usage.cache_read.unwrap_or_default(),
@@ -617,7 +716,12 @@ fn write_session_header(out: &mut dyn Write, s: &Session) -> io::Result<()> {
     writeln!(out)
 }
 
+/// `m` as `show` prints it: nothing for a row with nothing to read (an attachment, session
+/// context, usage alone), which JSON output still holds.
 fn write_message_text(out: &mut dyn Write, m: &Message) -> io::Result<()> {
+    if message_summary(m).is_none() {
+        return Ok(());
+    }
     writeln!(out, "── {} · {} ──", role_name(&m.role), age(m.timestamp))?;
     for block in &m.content {
         match block {
@@ -635,7 +739,7 @@ fn write_message_text(out: &mut dyn Write, m: &Message) -> io::Result<()> {
             Content::ToolUse(tu) => {
                 write!(out, "[tool-call {}]", sanitize(&tu.name))?;
                 if !tu.input.is_null() {
-                    write!(out, " {}", sanitize(&tu.input.to_string()))?;
+                    write!(out, " {}", sanitize(&input_text(&tu.input)))?;
                 }
                 writeln!(out)?;
             }
@@ -660,6 +764,12 @@ fn write_message_text(out: &mut dyn Write, m: &Message) -> io::Result<()> {
         }
     }
     writeln!(out)
+}
+
+/// A call's input as text: a string (a Codex call's arguments, a freeform tool's input) as it
+/// is, any other JSON as encoded.
+fn input_text(input: &serde_json::Value) -> Cow<'_, str> {
+    input.as_str().map_or_else(|| Cow::Owned(input.to_string()), Cow::Borrowed)
 }
 
 fn short_id(session_id: &str) -> &str {
@@ -781,10 +891,13 @@ fn display_role(m: &Message, summary: &Summary) -> (String, Ansi) {
 }
 
 /// The session-group header line printed the first time a session appears in the pretty `tail`
-/// view and whenever the active session changes.
+/// view and whenever the active session changes. Names the session by its id once its metadata
+/// has arrived.
 fn tail_header(handle: &HarnessSession, session: Option<&Session>, color: bool) -> String {
     let bullet = paint("●", harness_color(handle.harness), color);
-    let id = paint(short_id(handle.session.as_ref()), Ansi::Bold, color);
+    let id = session
+        .map_or_else(|| short_id(handle.session.as_ref()).to_owned(), |s| s.atuin_id.short());
+    let id = paint(&id, Ansi::Bold, color);
     let harness_label = paint(harness_name(handle.harness), Ansi::Dim, color);
     let title = session.map(title_of).map(|t| one_line(t, SUMMARY_WIDTH)).unwrap_or_default();
     if title.is_empty() {
@@ -922,8 +1035,11 @@ fn parse_harness(value: &str) -> Result<HarnessKind, String> {
     match value {
         "claude-code" => Ok(HarnessKind::ClaudeCode),
         "codex" => Ok(HarnessKind::Codex),
+        "opencode" => Ok(HarnessKind::Opencode),
         "pi" => Ok(HarnessKind::Pi),
-        other => Err(format!("unknown harness `{other}` (expected claude-code, codex, or pi)")),
+        other => {
+            Err(format!("unknown harness `{other}` (expected claude-code, codex, opencode, or pi)"))
+        }
     }
 }
 
@@ -1200,7 +1316,7 @@ fn content_json(block: &Content, reasoning: Option<u64>) -> Option<ContentJson> 
             input: if tu.input.is_null() {
                 String::new()
             } else {
-                tu.input.to_string()
+                input_text(&tu.input).into_owned()
             },
         },
         Content::ToolResult(tr) => ContentJson::ToolResult {
@@ -1277,6 +1393,7 @@ mod tests {
     #[rstest]
     #[case("claude-code", HarnessKind::ClaudeCode)]
     #[case("codex", HarnessKind::Codex)]
+    #[case("opencode", HarnessKind::Opencode)]
     #[case("pi", HarnessKind::Pi)]
     fn parse_harness_maps_names(#[case] input: &str, #[case] want: HarnessKind) {
         assert_eq!(parse_harness(input).unwrap(), want);
@@ -1284,7 +1401,7 @@ mod tests {
 
     #[rstest]
     fn parse_harness_rejects_unknown_harnesses() {
-        assert!(parse_harness("opencode").is_err());
+        assert!(parse_harness("copilot").is_err());
     }
 
     #[rstest]
@@ -1341,6 +1458,15 @@ mod tests {
     }
 
     #[rstest]
+    fn the_short_id_resolves_a_session() {
+        let sessions =
+            vec![session(HarnessKind::Codex, "aaa"), session(HarnessKind::ClaudeCode, "bbb")];
+        let short = sessions[1].atuin_id.short();
+        let selected = select_session(sessions, &short).unwrap();
+        assert_eq!(selected, handle(HarnessKind::ClaudeCode, "bbb"));
+    }
+
+    #[rstest]
     fn ambiguous_prefix_is_an_error() {
         let sessions =
             vec![session(HarnessKind::Codex, "abc111"), session(HarnessKind::ClaudeCode, "abc222")];
@@ -1353,11 +1479,53 @@ mod tests {
         assert!(select_session(sessions, "zzz").is_err());
     }
 
+    /// A query starting with `-` is a query, after `--` or not; flags still parse around it.
     #[rstest]
-    fn ambiguous_id_across_harnesses_is_an_error() {
-        let sessions =
-            vec![session(HarnessKind::Codex, "dup"), session(HarnessKind::ClaudeCode, "dup")];
-        assert!(select_session(sessions, "dup").is_err());
+    #[case::bare(&["search", "-v"])]
+    #[case::after_dashes(&["search", "--", "-v"])]
+    #[case::before_a_flag(&["search", "-v", "--limit", "3"])]
+    #[case::after_a_flag(&["search", "--limit", "3", "-v"])]
+    fn a_search_query_may_start_with_a_hyphen(#[case] args: &[&str]) {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: Cmd,
+        }
+
+        let cli = <Cli as clap::Parser>::try_parse_from(
+            std::iter::once("threads").chain(args.iter().copied()),
+        )
+        .unwrap();
+        let Cmd::Search { query, .. } = cli.cmd else {
+            panic!("not a search");
+        };
+        assert_eq!(query, "-v");
+    }
+
+    #[rstest]
+    fn an_exact_id_wins_over_the_ids_it_prefixes() {
+        let sessions = vec![
+            session(HarnessKind::Codex, "abc"),
+            session(HarnessKind::ClaudeCode, "abcdef"),
+            session(HarnessKind::Pi, "abcxyz"),
+        ];
+        assert_eq!(select_session(sessions, "abc").unwrap(), handle(HarnessKind::Codex, "abc"));
+    }
+
+    /// An id several agents' sessions have names none of them, and says how to name each.
+    #[rstest]
+    fn an_id_shared_across_harnesses_lists_their_atuin_ids() {
+        let sessions = vec![
+            session(HarnessKind::Codex, "dup"),
+            session(HarnessKind::ClaudeCode, "dup"),
+            session(HarnessKind::Pi, "dupe"),
+        ];
+        let ids: Vec<String> = sessions.iter().map(|s| s.atuin_id.short()).collect();
+        let err = select_session(sessions.clone(), "dup").unwrap_err().to_string();
+        assert!(err.contains(&ids[0]) && err.contains(&ids[1]), "{err}");
+        assert!(!err.contains(&ids[2]), "{err}");
+        let picked = select_session(sessions, &ids[1]).unwrap();
+        assert_eq!(picked, handle(HarnessKind::ClaudeCode, "dup"));
     }
 
     #[rstest]
@@ -1426,9 +1594,9 @@ mod tests {
         let mut out = Vec::new();
         write_session_header(&mut out, &s).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains(&format!("parent    {}\n", id(1))), "{text}");
-        assert!(text.contains(&format!("root      {}\n", id(2))), "{text}");
-        assert!(text.contains(&format!("children  {}, {}\n", id(3), id(4))), "{text}");
+        assert!(text.contains(&format!("parent      {}\n", id(1))), "{text}");
+        assert!(text.contains(&format!("root        {}\n", id(2))), "{text}");
+        assert!(text.contains(&format!("children    {}, {}\n", id(3), id(4))), "{text}");
 
         let alone = session(HarnessKind::Codex, "alone");
         let v = serde_json::to_value(session_json(&alone)).unwrap();
@@ -1527,6 +1695,37 @@ mod tests {
     }
 
     #[rstest]
+    #[case::empty(vec![], false)]
+    #[case::blank(vec![Content::Text(" \n".to_owned())], false)]
+    #[case::raw(vec![Content::Other(json!({"type": "attachment"}))], false)]
+    #[case::text(vec![Content::Text("hi".to_owned())], true)]
+    #[case::uncaptured_call(vec![tool_call("Bash")], true)]
+    fn show_prints_only_rows_with_something_to_read(
+        #[case] content: Vec<Content>,
+        #[case] printed: bool,
+    ) {
+        let mut out = Vec::new();
+        write_message_text(&mut out, &msg(Role::Other(String::new()), content)).unwrap();
+        assert_eq!(!out.is_empty(), printed, "{}", String::from_utf8_lossy(&out));
+    }
+
+    /// A call's text input and a result's text blocks read as text, not as escaped JSON.
+    #[rstest]
+    fn show_prints_tool_text_as_text() {
+        let call = Content::ToolUse(ToolUse {
+            id: ToolCallId::from("c1".to_owned()),
+            name: "exec".to_owned(),
+            input: json!("const out = \"hi\";"),
+        });
+        let result = tool_result(json!([{"type": "text", "text": "line 1\nline 2"}]), false);
+        let mut out = Vec::new();
+        write_message_text(&mut out, &msg(Role::Assistant, vec![call, result])).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("[tool-call exec] const out = \"hi\";\n"), "{out}");
+        assert!(out.contains("[tool-result] line 1\nline 2\n"), "{out}");
+    }
+
+    #[rstest]
     fn summary_marks_thinking() {
         let m = msg(Role::Assistant, vec![Content::ReasoningSummary { tokens: Some(7) }]);
         assert_eq!(message_summary(&m).unwrap().render(false), "» Reasoning · 7 tokens");
@@ -1560,7 +1759,7 @@ mod tests {
         s.title = Some("My Session".to_owned());
         assert_eq!(
             tail_header(&s.handle, Some(&s), false),
-            "● abcdef012345 · claude-code · My Session"
+            format!("● {} · claude-code · My Session", s.atuin_id.short())
         );
     }
 

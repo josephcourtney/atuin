@@ -7,6 +7,7 @@ use atuin_client::history::{AuthorPattern, History};
 use atuin_client::settings::FilterMode;
 use atuin_common::ansi;
 use atuin_common::filter::OrFilter;
+use atuin_common::path::PathBufExt as _;
 use atuin_common::time::UtcOffsetExt;
 use easy_cast::Conv;
 use enum_dispatch::enum_dispatch;
@@ -33,7 +34,7 @@ use crate::permissions::rule::Rule;
 /// `?`, and `[...]` via `glob_match`.
 fn path_matches_scope(path: &Path, scope: &str) -> bool {
     let path = if path.is_relative() {
-        std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf())
+        std::env::current_dir().map(|cwd| cwd.joined(path)).unwrap_or_else(|_| path.to_path_buf())
     } else {
         path.to_path_buf()
     };
@@ -318,7 +319,7 @@ impl ReadToolCall {
     pub fn resolved_path(&self) -> PathBuf {
         if self.path.is_relative() {
             std::env::current_dir()
-                .map(|cwd| cwd.join(&self.path))
+                .map(|cwd| cwd.joined(&self.path))
                 .unwrap_or_else(|_| self.path.clone())
         } else {
             self.path.clone()
@@ -377,8 +378,8 @@ impl ReadToolCall {
 
                 if numbered.len() > 100_000 {
                     ToolOutcome::Error(format!(
-                        "Error: file is too large to read ({} bytes in {} lines); use view_range \
-                         to read a subset of the file",
+                        "Error: file is too large to read ({} bytes in {} lines); use read_file \
+                         with offset and a smaller limit to read a subset of the file",
                         numbered.len(),
                         lines.len()
                     ))
@@ -452,7 +453,7 @@ impl EditToolCall {
     pub fn resolved_path(&self) -> PathBuf {
         if self.path.is_relative() {
             std::env::current_dir()
-                .map(|cwd| cwd.join(&self.path))
+                .map(|cwd| cwd.joined(&self.path))
                 .unwrap_or_else(|_| self.path.clone())
         } else {
             self.path.clone()
@@ -642,7 +643,7 @@ impl WriteToolCall {
     pub fn resolved_path(&self) -> PathBuf {
         if self.path.is_relative() {
             std::env::current_dir()
-                .map(|cwd| cwd.join(&self.path))
+                .map(|cwd| cwd.joined(&self.path))
                 .unwrap_or_else(|_| self.path.clone())
         } else {
             self.path.clone()
@@ -1111,12 +1112,16 @@ impl PermissibleToolCall for AtuinHistoryToolCall {
 }
 
 impl AtuinHistoryToolCall {
-    pub(crate) async fn execute(&self, db: &atuin_client::database::Sqlite) -> ToolOutcome {
+    pub(crate) async fn execute(
+        &self,
+        db: &atuin_client::database::Sqlite,
+        settings: &atuin_client::settings::Settings,
+    ) -> ToolOutcome {
         use atuin_client::database::{self, DbSearchMode, OptFilters};
 
         // query_context rather than current_context: when running outside an
         // atuin-hooked shell (e.g. as an MCP server) there is no ATUIN_SESSION.
-        let context = match database::query_context().await {
+        let context = match database::query_context(settings).await {
             Ok(ctx) => ctx,
             Err(e) => return ToolOutcome::Error(format!("Failed to get history context: {e}")),
         };
@@ -1496,7 +1501,7 @@ mod tests {
     fn relative_multi_segment_glob(#[case] scope: &str, #[case] expected: bool) {
         // This matches against the path relative to cwd
         let cwd = std::env::current_dir().unwrap();
-        let abs = cwd.join("crates").join("atuin-ai").join("src").join("lib.rs");
+        let abs = cwd.joined("crates").joined("atuin-ai").joined("src").joined("lib.rs");
         let tool = read_tool(abs.to_str().unwrap());
         assert_eq!(tool.matches_rule(&read_rule(Some(scope))), expected);
     }
@@ -1788,7 +1793,7 @@ mod tests {
             let file_path = dir.path().join("config.toml");
             std::fs::write(&file_path, "[db]\nhost = localhost\nport = 5432\n").unwrap();
 
-            let snapshot_dir = dir.path().join("snapshots").join("session-1");
+            let snapshot_dir = dir.path().join("snapshots").joined("session-1");
             let mut tracker = FileReadTracker::default();
             let mut store = SnapshotStore::open(snapshot_dir.clone()).unwrap();
 
@@ -1910,7 +1915,7 @@ mod tests {
             let file_path = dir.path().join("config.toml");
             std::fs::write(&file_path, "a = 1\nb = 2\n").unwrap();
 
-            let snapshot_dir = dir.path().join("snapshots").join("session-1");
+            let snapshot_dir = dir.path().join("snapshots").joined("session-1");
             let mut tracker = FileReadTracker::default();
             let mut store = SnapshotStore::open(snapshot_dir).unwrap();
 
@@ -2022,7 +2027,7 @@ mod tests {
 
         #[rstest]
         fn creates_parent_directories(tempdir: tempfile::TempDir) {
-            let path = tempdir.path().join("sub").join("dir").join("file.txt");
+            let path = tempdir.path().join("sub").joined("dir").joined("file.txt");
 
             let call = WriteToolCall {
                 path: path.clone(),

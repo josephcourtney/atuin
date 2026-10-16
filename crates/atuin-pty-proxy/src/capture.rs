@@ -114,6 +114,9 @@ impl TrackerCore {
 
     /// Start capturing command output.
     fn start_capture(&mut self, history_id: HistoryId) {
+        if self.history_id().is_some() {
+            crate::diagnostics::event("capture_abandoned", "new_start_before_end");
+        }
         self.disable_alternate_screen();
 
         // Clear any previous in-progress capture for which we never received an end marker.
@@ -123,11 +126,13 @@ impl TrackerCore {
         // command's output without confusing it for other data that was already in the terminal.
         self.emulator.process(CLEAR_SCREEN_CONTENTS);
         *self.history_id_mut() = Some(history_id);
+        crate::diagnostics::event("capture_start", "marker_accepted");
     }
 
     /// Stop capturing command output.
     fn end_capture(&mut self, history_id: HistoryId, marker_len: usize) {
         let Some(current_id) = self.history_id() else {
+            crate::diagnostics::event("capture_ignored", "end_without_start");
             // We never received a start marker, so we haven't been capturing any output; simply
             // ignore the end marker.
             return;
@@ -136,6 +141,7 @@ impl TrackerCore {
         self.disable_alternate_screen();
 
         if current_id != history_id {
+            crate::diagnostics::event("capture_discarded", "history_id_mismatch");
             // The history ID in the end marker doesn't match the history ID in the start marker;
             // discard the output to avoid saving corrupted data or attributing the output to the
             // wrong command.
@@ -191,6 +197,17 @@ impl TrackerCore {
         }
 
         let (rows, cols) = self.emulator.screen().size();
+        if crate::diagnostics::enabled() {
+            let retained_bytes =
+                contents.start.len() + contents.end.as_ref().map_or(0, String::len);
+            crate::diagnostics::event(
+                "capture_ready",
+                format_args!(
+                    "observed_bytes={output_observed_bytes} retained_bytes={retained_bytes}"
+                ),
+            );
+        }
+        crate::diagnostics::event("sink_invoke", "capture_completed");
         (self.sink)(history_id, CommandCapture {
             output_start: contents.start,
             output_end: contents.end,
@@ -198,12 +215,19 @@ impl TrackerCore {
             terminal_width: cols.get(),
             terminal_height: rows.get(),
         });
+        crate::diagnostics::event("sink_return", "capture_completed");
     }
 
     fn handle_chunk(&mut self, chunk: EventChunk<'_>) {
         match chunk.event {
-            Event::OutputStart(history_id) => self.start_capture(history_id),
-            Event::OutputEnd(history_id) => self.end_capture(history_id, chunk.osc_len),
+            Event::OutputStart(history_id) => {
+                crate::diagnostics::event("marker", "output_start");
+                self.start_capture(history_id);
+            }
+            Event::OutputEnd(history_id) => {
+                crate::diagnostics::event("marker", "output_end");
+                self.end_capture(history_id, chunk.osc_len);
+            }
         }
     }
 

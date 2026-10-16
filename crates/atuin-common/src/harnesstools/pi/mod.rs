@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use super::rehydrate::{RehydrateError, RehydrateSession};
 use super::resume::{self, CwdRequirement, ResumeError, ResumePlan, ResumeTarget};
 use super::{Harness, InstallHookError};
-use crate::utils::{env_nonempty, home_dir};
+use crate::dirs::home_dir;
+use crate::env::var_nonempty;
+use crate::path::PathBufExt as _;
 
 pub mod rehydrate;
 pub mod session;
@@ -11,8 +13,8 @@ pub mod session;
 /// Pi's config directory: `PI_CODING_AGENT_DIR`, else `~/.pi/agent` (pi-mono
 /// `packages/coding-agent/src/config.ts` `getAgentDir`).
 fn agent_dir() -> PathBuf {
-    env_nonempty("PI_CODING_AGENT_DIR")
-        .map_or_else(|| home_dir().join(".pi").join("agent"), |dir| expand_tilde(&dir))
+    var_nonempty("PI_CODING_AGENT_DIR")
+        .map_or_else(|| home_dir().joined(".pi").joined("agent"), |dir| expand_tilde(&dir))
 }
 
 /// Expand a leading `~` the way pi does for its path settings and variables (pi-mono
@@ -26,7 +28,7 @@ fn expand_tilde(path: &std::ffi::OsStr) -> PathBuf {
                 p == "~" || p.starts_with("~/") || (cfg!(windows) && p.starts_with("~\\"))
             }) =>
         {
-            home_dir().join(rest)
+            home_dir().joined(rest)
         }
         _ => path.to_path_buf(),
     }
@@ -52,11 +54,11 @@ impl Harness for Pi {
         const PLUGIN_SOURCE: &str = include_str!("../../../res/harnesstools/pi/atuin.ts");
         const PLUGIN_NAME: &str = "atuin.ts";
 
-        let extensions_dir = agent_dir().join("extensions");
+        let extensions_dir = agent_dir().joined("extensions");
 
         tokio::fs::create_dir_all(&extensions_dir).await?;
 
-        let extension_path = extensions_dir.join(PLUGIN_NAME);
+        let extension_path = extensions_dir.joined(PLUGIN_NAME);
 
         let already_installed = tokio::fs::read_to_string(&extension_path)
             .await

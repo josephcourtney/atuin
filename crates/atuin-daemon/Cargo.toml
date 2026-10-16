@@ -12,7 +12,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-octavo = ["dep:atuin-octavo"]
+octavo = ["dep:atuin-octavo", "atuin-client/octavo"]
 
 [dependencies]
 async-stream = { workspace = true }
@@ -59,7 +59,7 @@ uuid = { workspace = true }
 listenfd = { workspace = true }
 
 [dev-dependencies]
-atuin-common = { workspace = true, features = ["os", "sqlite"] }
+atuin-common = { workspace = true, features = ["test-utils"] }
 divan = { workspace = true }
 proptest = { workspace = true }
 regex = { workspace = true }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 #[cfg(feature = "octavo")]
 use atuin_client::history::HistoryId;
 use atuin_client::settings::Settings;
@@ -16,6 +18,8 @@ use eyre::WrapErr;
 use toml_edit::{Document, DocumentMut, Item, Table, TableLike, Value};
 use tracing::instrument;
 
+#[cfg(all(feature = "ai", feature = "daemon"))]
+use crate::command::client::ai_sessions;
 #[cfg(feature = "daemon")]
 use crate::command::client::daemon;
 use crate::i18n::fl;
@@ -41,7 +45,7 @@ pub enum Cmd {
 
 impl Cmd {
     #[instrument(level = "trace", skip_all, err)]
-    pub async fn run(self, settings: &Settings) -> Result<()> {
+    pub async fn run(self, settings: &Arc<Settings>) -> Result<()> {
         match self {
             Self::Get(get) => get.run(settings).await,
             Self::Set(set) => set.run(settings).await,
@@ -264,10 +268,19 @@ pub enum Feature {
     #[cfg(feature = "octavo")]
     #[value(help = fl!("value-config-feature-octavo"))]
     Octavo,
+    #[cfg(all(feature = "ai", feature = "daemon"))]
+    #[value(help = fl!("value-config-feature-threads"), alias = "ai-sessions")]
+    Threads,
 }
 
 impl EnableCmd {
-    pub async fn run(self, settings: &Settings) -> Result<()> {
+    pub async fn run(self, settings: &Arc<Settings>) -> Result<()> {
+        #[cfg(all(feature = "ai", feature = "daemon"))]
+        if self.feature == Feature::Threads {
+            ai_sessions::enable(settings, &mut ai_sessions::Terminal::stdio()).await?;
+            return Ok(());
+        }
+
         #[cfg(feature = "octavo")]
         let octavo = match self.feature {
             Feature::Octavo => {
@@ -277,7 +290,7 @@ impl EnableCmd {
                 };
                 Some(onboarding)
             }
-            Feature::Daemon | Feature::OutputCapture => None,
+            _ => None,
         };
 
         let config_file = Settings::get_config_path()?;
@@ -316,7 +329,11 @@ impl EnableCmd {
         backfilled
     }
 
-    fn get_updated_config(&self, config_str: &str, daemon_enabled: bool) -> Result<String> {
+    pub(super) fn get_updated_config(
+        &self,
+        config_str: &str,
+        daemon_enabled: bool,
+    ) -> Result<String> {
         let mut doc: DocumentMut = config_str.parse()?;
 
         // An already-running daemon may be managed externally (systemd, launchd), so leave
@@ -334,6 +351,10 @@ impl EnableCmd {
             }
             #[cfg(feature = "octavo")]
             Feature::Octavo => set_deep_key(&mut doc, "octavo.enabled", Value::from(true))?,
+            #[cfg(all(feature = "ai", feature = "daemon"))]
+            Feature::Threads => {
+                set_deep_key(&mut doc, "threads.capture", Value::from(true))?;
+            }
         }
 
         let updated = doc.to_string();
@@ -374,7 +395,7 @@ impl OctavoOnboarding {
 /// Asks the user to enable Octavo, and whether to upload the history they already have; `None`
 /// if they decline.
 #[cfg(feature = "octavo")]
-async fn onboard_octavo(settings: &Settings) -> Result<Option<OctavoOnboarding>> {
+async fn onboard_octavo(settings: &Arc<Settings>) -> Result<Option<OctavoOnboarding>> {
     let login = match HubClient::new(settings)?.login(settings).await {
         Ok(login) => login,
         Err(HubCallError::NotLoggedIn) => eyre::bail!(fl!("config-enable-octavo-not-logged-in")),
@@ -419,7 +440,7 @@ async fn onboard_octavo(settings: &Settings) -> Result<Option<OctavoOnboarding>>
     };
 
     // Opened before the config says Octavo is on, so a queue that can't be opened leaves it off.
-    let queue = UploadQueue::open(Settings::octavo_queue_path())
+    let queue = UploadQueue::open(settings.octavo_queue_path())
         .await
         .wrap_err("failed to open Octavo's upload queue")?;
 
@@ -454,6 +475,9 @@ impl DisableCmd {
             Feature::OutputCapture => restart_autostarted_daemon(settings).await,
             #[cfg(feature = "octavo")]
             Feature::Octavo => restart_autostarted_daemon(settings).await,
+            // The daemon notices the change itself, and the shell doesn't care.
+            #[cfg(feature = "ai")]
+            Feature::Threads => return Ok(()),
         }
 
         println!("Restart your shell for the change to take effect.");
@@ -477,6 +501,10 @@ impl DisableCmd {
             }
             #[cfg(feature = "octavo")]
             Feature::Octavo => set_deep_key(&mut doc, "octavo.enabled", Value::from(false))?,
+            #[cfg(all(feature = "ai", feature = "daemon"))]
+            Feature::Threads => {
+                set_deep_key(&mut doc, "threads.capture", Value::from(false))?;
+            }
         }
 
         let updated = doc.to_string();
@@ -739,7 +767,7 @@ mod tests {
         assert_eq!(set(input, key, value), expected);
     }
 
-    #[test]
+    #[rstest]
     fn setting_the_same_key_twice_keeps_its_comment() {
         let once = set(
             "[sync]\n# how often to sync\nfrequency = \"5m\" # unit is flexible\n",
@@ -817,6 +845,24 @@ mod tests {
         "[daemon]\nenabled = true\nautostart = false\n\n[pty_proxy]\nenabled = \
          true\n\n[output]\nenabled = true\n"
     )]
+    #[cfg_attr(
+        all(feature = "ai", feature = "daemon"),
+        case::threads(
+            Feature::Threads,
+            "",
+            false,
+            "[daemon]\nenabled = true\nautostart = true\n\n[threads]\ncapture = true\n"
+        )
+    )]
+    #[cfg_attr(
+        all(feature = "ai", feature = "daemon"),
+        case::threads_with_daemon_already_enabled(
+            Feature::Threads,
+            "[daemon]\nenabled = true\nautostart = false\n",
+            true,
+            "[daemon]\nenabled = true\nautostart = false\n\n[threads]\ncapture = true\n"
+        )
+    )]
     fn enable_writes(
         #[case] feature: Feature,
         #[case] input: &str,
@@ -833,6 +879,14 @@ mod tests {
     #[rstest]
     #[case::daemon(Feature::Daemon, "", "[daemon]\nenabled = false\nautostart = false\n")]
     #[case::output_capture(Feature::OutputCapture, "", "[output]\nenabled = false\n")]
+    #[cfg_attr(
+        all(feature = "ai", feature = "daemon"),
+        case::threads(
+            Feature::Threads,
+            "[daemon]\nenabled = true\n\n[threads]\ncapture = true\n",
+            "[daemon]\nenabled = true\n\n[threads]\ncapture = false\n"
+        )
+    )]
     #[case::daemon_search(
         Feature::Daemon,
         "search_mode = \"daemon-fuzzy\"\n[daemon]\nenabled = true",

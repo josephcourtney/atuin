@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 
 use atuin_common::os::unix::tty::TtyId;
 use atuin_common::os::unix::{SecureTempDirError, create_secure_temp_dir};
+use atuin_common::path::PathBufExt as _;
 use easy_cast::Conv;
 
 use crate::capture::{CaptureConfig, CommandCaptureTracker};
@@ -23,7 +24,7 @@ pub enum Msg {
 
 /// The path to the PTY proxy socket for the given terminal.
 pub fn socket_path(tty_id: TtyId) -> Result<PathBuf, SecureTempDirError> {
-    Ok(socket_dir()?.join(socket_name(tty_id)))
+    Ok(socket_dir()?.joined(socket_name(tty_id)))
 }
 
 /// The name of the PTY proxy socket for the given terminal.
@@ -35,7 +36,7 @@ fn socket_name(tty_id: TtyId) -> String {
 /// The directory in which PTY proxy sockets are stored.
 fn socket_dir() -> Result<PathBuf, SecureTempDirError> {
     let uid = atuin_common::os::unix::uid();
-    let dir = atuin_common::os::unix::tmp_dir().join(format!("atuin-{uid}"));
+    let dir = atuin_common::os::unix::tmp_dir().joined(format!("atuin-{uid}"));
     create_secure_temp_dir(dir)
 }
 
@@ -94,6 +95,10 @@ impl Parser {
     const SCROLLBACK_CAPACITY: usize = 50;
 
     fn new(rows: NonZeroU16, cols: NonZeroU16, options: ParserOptions) -> Self {
+        crate::diagnostics::event(
+            "parser_start",
+            format_args!("capture_enabled={}", options.command_capture.is_some()),
+        );
         Self {
             emulator: vt100::Parser::new(rows, cols, Self::SCROLLBACK_CAPACITY),
             tracker: options.command_capture.map(|c| CommandCaptureTracker::new(rows, cols, c)),
@@ -123,6 +128,10 @@ impl Parser {
                 // dimensions to 1.
                 let rows = NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN);
                 let cols = NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN);
+                crate::diagnostics::event(
+                    "parser_resize",
+                    format_args!("rows={} cols={}", rows.get(), cols.get()),
+                );
                 self.emulator.screen_mut().set_size(rows, cols);
                 if let Some(tracker) = &mut self.tracker {
                     tracker.resize(rows, cols);
@@ -150,6 +159,7 @@ pub fn spawn_parser_thread(
         for msg in screen_rx {
             parser.handle_msg(msg);
         }
+        crate::diagnostics::event("parser_stop", "channel_closed");
     })
 }
 
