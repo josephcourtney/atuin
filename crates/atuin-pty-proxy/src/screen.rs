@@ -95,6 +95,10 @@ impl Parser {
     const SCROLLBACK_CAPACITY: usize = 50;
 
     fn new(rows: NonZeroU16, cols: NonZeroU16, options: ParserOptions) -> Self {
+        crate::diagnostics::event(
+            "parser_start",
+            format_args!("capture_enabled={}", options.command_capture.is_some()),
+        );
         Self {
             emulator: vt100::Parser::new(rows, cols, Self::SCROLLBACK_CAPACITY),
             tracker: options.command_capture.map(|c| CommandCaptureTracker::new(rows, cols, c)),
@@ -124,6 +128,10 @@ impl Parser {
                 // dimensions to 1.
                 let rows = NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN);
                 let cols = NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN);
+                crate::diagnostics::event(
+                    "parser_resize",
+                    format_args!("rows={} cols={}", rows.get(), cols.get()),
+                );
                 self.emulator.screen_mut().set_size(rows, cols);
                 if let Some(tracker) = &mut self.tracker {
                     tracker.resize(rows, cols);
@@ -151,6 +159,7 @@ pub fn spawn_parser_thread(
         for msg in screen_rx {
             parser.handle_msg(msg);
         }
+        crate::diagnostics::event("parser_stop", "channel_closed");
     })
 }
 
