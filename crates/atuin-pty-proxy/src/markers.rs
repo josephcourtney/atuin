@@ -201,9 +201,7 @@ fn parse_marker(params: &[u8]) -> Option<Event> {
         crate::diagnostics::event("marker_rejected", "unknown_kind");
         return None;
     }
-    let Some(history_id) = std::str::from_utf8(rest)
-        .ok()
-        .and_then(|s| s.parse::<HistoryId>().ok())
+    let Some(history_id) = std::str::from_utf8(rest).ok().and_then(|s| s.parse::<HistoryId>().ok())
     else {
         crate::diagnostics::event("marker_rejected", "invalid_history_id");
         return None;

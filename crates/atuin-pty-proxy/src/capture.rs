@@ -202,7 +202,9 @@ impl TrackerCore {
                 contents.start.len() + contents.end.as_ref().map_or(0, String::len);
             crate::diagnostics::event(
                 "capture_ready",
-                format_args!("observed_bytes={output_observed_bytes} retained_bytes={retained_bytes}"),
+                format_args!(
+                    "observed_bytes={output_observed_bytes} retained_bytes={retained_bytes}"
+                ),
             );
         }
         crate::diagnostics::event("sink_invoke", "capture_completed");

@@ -33,12 +33,7 @@ fn logger() -> Option<&'static Logger> {
     LOGGER
         .get_or_init(|| {
             let path = diagnostic_path(std::env::var_os("ATUIN_PTY_CAPTURE_DIAGNOSTICS")?)?;
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&path)
-                .ok()?;
+            let file = OpenOptions::new().create(true).append(true).mode(0o600).open(&path).ok()?;
             if file.set_permissions(std::fs::Permissions::from_mode(0o600)).is_err() {
                 return None;
             }
