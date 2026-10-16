@@ -26,13 +26,14 @@ help:
     Atuin patched PTY proxy
     =======================
 
-    This fork propagates terminal pixel dimensions through Atuin's PTY proxy.
+    This fork propagates terminal pixel dimensions through Atuin's PTY proxy
+    and provides opt-in metadata-only capture diagnostics.
     Generic downstream-patch state is stored in .patch-base.env.
 
     Typical upgrade
     ---------------
       brew upgrade atuin
-      just upgrade NEW          # e.g. just upgrade 18.23.0
+      just upgrade NEW          # replace NEW with the release number
 
     Then open a new terminal and run:
       just proxy-status
@@ -197,10 +198,17 @@ proxy-list:
             "$child" "$child_tty" "$child_cmd"
     done <<< "$pids"
 
-# Confirm that this terminal is actually running under a patched proxy.
+# Confirm that this terminal is attached to a PTY proxy and that the
+# process ancestry includes the patched proxy. The attachment check avoids a
+# false positive in nested terminals inheriting the outer proxy's environment.
 proxy-status:
     #!/usr/bin/env bash
     set -euo pipefail
+
+    if [[ "$(atuin __internal pty-proxy-active 2>/dev/null || true)" != "1" ]]; then
+        echo "active: no (this terminal is not attached to an Atuin PTY proxy)"
+        exit 1
+    fi
 
     pid=$PPID
     while [[ "$pid" -gt 1 ]]; do
