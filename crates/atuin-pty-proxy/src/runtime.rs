@@ -235,7 +235,6 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
         .ok();
 
     let (msg_tx, msg_rx) = mpsc::sync_channel::<Msg>(64);
-<<<<<<< HEAD
     let _parser_handle = screen::spawn_parser_thread(
         rows,
         cols,
@@ -245,12 +244,6 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
             debug_osc133: options.debug_osc133,
         },
     );
-=======
-    let _parser_handle = screen::spawn_parser_thread(rows, cols, msg_rx, screen::ParserOptions {
-        command_capture: options.command_capture,
-        debug_markers: options.debug_markers,
-    });
->>>>>>> ef59302 (feat(pty-proxy): switch from OSC 133 to Atuin-specific sequence (#4291))
 
     let socket_path = if let Some((server, path)) = server_and_path {
         server.spawn(msg_tx.clone());
