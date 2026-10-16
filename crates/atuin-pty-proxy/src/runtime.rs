@@ -120,6 +120,13 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
         })
         .ok();
 
+    crate::diagnostics::event(
+        "proxy_start",
+        format_args!(
+            "protocol={PROTOCOL_VERSION} capture_enabled={}",
+            options.command_capture.is_some()
+        ),
+    );
     let (msg_tx, msg_rx) = mpsc::sync_channel::<Msg>(64);
     let _parser_handle = screen::spawn_parser_thread(rows, cols, msg_rx, screen::ParserOptions {
         command_capture: options.command_capture,
@@ -183,7 +190,12 @@ fn run(options: RuntimeOptions) -> Result<(), Error> {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let raw_data = &buf[..n];
-                    let _ = msg_tx.send(Msg::Data(raw_data.to_vec()));
+                    if crate::diagnostics::enabled() {
+                        crate::diagnostics::event("pty_read", format_args!("bytes={n}"));
+                    }
+                    if msg_tx.send(Msg::Data(raw_data.to_vec())).is_err() {
+                        crate::diagnostics::event("parser_queue_error", "receiver_disconnected");
+                    }
                     cwd_updater.update();
 
                     let highlighted;
