@@ -1,3 +1,23 @@
+> [!IMPORTANT]
+> **Local downstream maintenance fork.** This repository carries a small Atuin PTY
+> proxy patch for terminal pixel dimensions. The upstream documentation below
+> applies to Atuin generally; the patch, installation, and downstream checks
+> are described in [Patch maintenance](docs/PATCH_MAINTENANCE.md) and
+> [Troubleshooting](docs/TROUBLESHOOTING.md).
+>
+> **Normal maintainer workflow:** `just doctor` → `just prepare VERSION` →
+> `just stage` → `just install-candidate PATH` → open a new terminal →
+> `just qualify-live`. The candidate is built and checked before the stable
+> `atuin-patched` symlink is changed. The pre-existing `just upgrade VERSION`
+> is retained as a legacy direct-install operation.
+>
+> **Do not mistake release equality for operational compatibility.** Different
+> source builds can report the same Atuin release; live proxy process identity,
+> daemon handshake, and freshly persisted command output must be verified
+> separately. The diagnostics do not modify the daemon automatically.
+
+---
+
 <p align="center">
  <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/atuinsh/atuin/assets/53315310/13216a1d-1ac0-4c99-b0eb-d88290fe0efd">
