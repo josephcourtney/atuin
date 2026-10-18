@@ -286,7 +286,8 @@ stage: qualify-candidate
     version="$(target/release/atuin --version)"
     version="${version#atuin }"
     version="${version%% *}"
-    dest="{{ env_var("HOME") }}/.local/bin/atuin-patched-$version"
+    revision="$(git rev-parse --short=12 HEAD)"
+    dest="{{ env_var("HOME") }}/.local/bin/atuin-patched-$version-$revision"
     mkdir -p "$(dirname "$dest")"
     if [[ -e "$dest" ]]; then
         cmp -s target/release/atuin "$dest" || { echo >&2 "error: existing candidate differs: $dest"; exit 1; }
