@@ -34,7 +34,7 @@ The staged path is printed. Review the `patch-target` diff and test output.
 Do not change the live proxy while unresolved conflicts or tests remain.
 
 ```sh
-just install-candidate ~/.local/bin/atuin-patched-18.24.1
+just install-candidate ~/.local/bin/atuin-patched-18.24.1-<revision>
 ```
 
 The exact versioned path must match the printed staging path. Activation
