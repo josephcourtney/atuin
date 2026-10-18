@@ -1,0 +1,23 @@
+name: Fork maintenance helpers
+on:
+  pull_request:
+    paths:
+      - "scripts/atuin_*.py"
+      - "scripts/probe_*.py"
+      - "scripts/check_downstream.py"
+      - "tests/test_atuin_maintenance.py"
+      - ".github/workflows/fork-maintenance.yml"
+  workflow_dispatch:
+
+jobs:
+  helper-tests:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile helper scripts
+        run: python3 -m compileall -q scripts/atuin_doctor.py scripts/atuin_install.py scripts/check_downstream.py scripts/probe_capture.py scripts/probe_pty.py
+      - name: Run offline unit tests
+        run: python3 -m unittest discover -s tests -p test_atuin_maintenance.py -v
