@@ -315,3 +315,10 @@ cleanup:
     @git worktree list
     @git branch -vv
     @echo 'Inspection only. Remove known disposable clean worktrees manually.'
+
+# Report pinned Git distribution origins for the installed downstream consumers.
+downstream-status:
+    python3 scripts/check_downstream.py
+
+# Live ecosystem smoke gates; these require installed Copout and a working daemon.
+test-ecosystem: downstream-status test-capture
