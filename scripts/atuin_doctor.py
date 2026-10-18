@@ -44,6 +44,17 @@ def diagnose():
         "daemon": daemon, "config": config,
         "uv_tools": installed,
     }
+    proxy_lines = [line for line in proxy_processes.get("stdout", "").splitlines() if "pty-proxy" in line]
+    patched_lines = [line for line in proxy_lines if "atuin-patched" in line]
+    upstream_lines = [line for line in proxy_lines if "atuin-patched" not in line]
+    data["proxy_identity"] = {
+        "classification": ("mixed" if patched_lines and upstream_lines else
+                           "patched" if patched_lines else
+                           "upstream" if upstream_lines else "unknown"),
+        "patched_count": len(patched_lines),
+        "upstream_count": len(upstream_lines),
+        "scope": "host-wide processes; not necessarily this terminal",
+    }
     problems = []
     if not brew.get("ok"): problems.append("Homebrew Atuin cannot run")
     if not patched.get("ok"): problems.append("patched Atuin cannot run")
@@ -69,10 +80,11 @@ def main():
         print(f"daemon: {d['daemon'].get('stdout') or d['daemon'].get('stderr') or d['daemon'].get('error')}")
         print(f"proxy active check: {d['active_proxy_rpc'].get('stdout') or 'unavailable'}")
         print(f"proxy processes: {d['proxy_processes'].get('stdout') or 'none detected'}")
+        print(f"proxy identity: {d['proxy_identity']['classification']} (host-wide)")
         print(f"capture: {d['capture_state']}")
         for issue in d["problems"]:
             print(f"FAIL: {issue}")
-        if not d["problems"]: print("No known prerequisites failed; run just test-capture for end-to-end qualification.")
+        if not d["problems"]: print("No known binary/daemon prerequisites failed; proxy identity and capture still need qualification.")
     return 1 if a.strict and d["problems"] else 0
 
 if __name__ == "__main__":
