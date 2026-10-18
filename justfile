@@ -33,7 +33,7 @@ help:
     Typical upgrade
     ---------------
       brew upgrade atuin
-      just upgrade NEW          # replace NEW with the release number
+      just prepare NEW          # update and build without installing\n      just qualify-candidate    # read-only checks before activation\n      just stage                # stage versioned candidate\n      just install-candidate PATH\n      just qualify-live         # validate new shell and output capture
 
     Then open a new terminal and run:
       just proxy-status
@@ -46,7 +46,7 @@ help:
       just patch                Show changes relative to the recorded base
       just update NEW           Rebase patch onto a new release, no rebuild
       just rebuild              Check, test, build, install, and verify
-      just proxy-list           List all running patched proxy versions
+      just proxy-list           List all running patched proxy versions\n      just doctor               Diagnose builds, daemon, proxy and config\n      just test-capture         Prove fresh command output persistence\n      just rollback             Restore prior stable patched symlink
 
     If rebase conflicts
     -------------------
@@ -235,3 +235,91 @@ proxy-status:
 
     echo "active: no"
     exit 1
+
+# Read-only environment summary; --json is intended for support bundles.
+doctor *args:
+    python3 scripts/atuin_doctor.py {{ args }}
+
+status:
+    @git status --short --branch
+    @just base
+    @just doctor
+
+# Validate local PTY geometry (the actual proxy path also needs live qualification).
+test-proxy:
+    python3 scripts/probe_pty.py
+
+# End-to-end user-environment qualification; creates one unique test history entry.
+test-capture:
+    python3 scripts/probe_capture.py
+
+# Check versioned executable and local prerequisites without changing activation.
+qualify-candidate: check verify-candidate test-proxy
+
+verify-candidate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -x target/release/atuin
+    upstream="$("{{ atuin_bin }}" --version)"
+    candidate="$(target/release/atuin --version)"
+    upstream="${upstream#atuin }"; upstream="${upstream%% *}"
+    candidate="${candidate#atuin }"; candidate="${candidate%% *}"
+    printf 'Homebrew release: %s\\nCandidate release: %s\\n' "$upstream" "$candidate"
+    test "$upstream" = "$candidate"
+
+# Runtime checks must run after activation and in an isolated login shell.
+qualify-live: doctor-strict test-capture
+
+doctor-strict:
+    python3 scripts/atuin_doctor.py --strict
+
+# Prepare an upstream release without changing the active executable.
+prepare new_release:
+    just update "{{ new_release }}"
+    just build
+    just qualify-candidate
+
+# Create a versioned candidate without switching the live symlink.
+stage: qualify-candidate
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$(target/release/atuin --version)"
+    version="${version#atuin }"
+    version="${version%% *}"
+    revision="$(git rev-parse --short=12 HEAD)"
+    dest="{{ env_var("HOME") }}/.local/bin/atuin-patched-$version-$revision"
+    mkdir -p "$(dirname "$dest")"
+    if [[ -e "$dest" ]]; then
+        cmp -s target/release/atuin "$dest" || { echo >&2 "error: existing candidate differs: $dest"; exit 1; }
+    else
+        install -m 755 target/release/atuin "$dest"
+    fi
+    printf 'candidate: %s\\n' "$dest"
+
+# Explicit promotion; does not restart existing proxy or daemon processes.
+install-candidate candidate:
+    python3 scripts/atuin_install.py activate "{{ candidate }}"
+
+rollback:
+    python3 scripts/atuin_install.py rollback
+
+# Former one-step behavior retained under an explicit legacy name.
+upgrade-legacy new_release:
+    just upgrade "{{ new_release }}"
+
+# A non-production diagnostic and evidence report.
+report:
+    python3 scripts/atuin_doctor.py --json
+
+# Only consider cleanup; do not delete other worktrees or branches automatically.
+cleanup:
+    @git worktree list
+    @git branch -vv
+    @echo 'Inspection only. Remove known disposable clean worktrees manually.'
+
+# Report pinned Git distribution origins for the installed downstream consumers.
+downstream-status:
+    python3 scripts/check_downstream.py
+
+# Live ecosystem smoke gates; these require installed Copout and a working daemon.
+test-ecosystem: downstream-status test-capture
