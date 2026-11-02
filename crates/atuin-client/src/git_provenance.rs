@@ -14,6 +14,83 @@ use tokio::time::timeout;
 
 const DEFAULT_PROBE_BUDGET: Duration = Duration::from_millis(300);
 
+/// Versioned command-lifecycle provenance envelope.
+///
+/// An event is explicitly bound to the Atuin history UUID that initiated the
+/// probe. No consumer may substitute a later snapshot for this evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitProvenanceEvent {
+    pub schema_version: u8,
+    pub history_id: crate::history::HistoryId,
+    pub phase: GitObservationPhase,
+    pub observed_at: time::OffsetDateTime,
+    pub outcome: GitObservationOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitObservationPhase {
+    CommandStart,
+    CommandEnd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum GitObservationOutcome {
+    Observed(GitObservation),
+    Unavailable(GitObservationUnavailable),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitObservationUnavailable {
+    GitUnavailable,
+    NotRepository,
+    Timeout,
+    Failed,
+}
+
+impl From<GitProbeUnavailable> for GitObservationUnavailable {
+    fn from(value: GitProbeUnavailable) -> Self {
+        match value {
+            GitProbeUnavailable::GitUnavailable => Self::GitUnavailable,
+            GitProbeUnavailable::NotRepository => Self::NotRepository,
+            GitProbeUnavailable::Timeout => Self::Timeout,
+            GitProbeUnavailable::Failed => Self::Failed,
+        }
+    }
+}
+
+impl GitProvenanceEvent {
+    pub const SCHEMA_VERSION: u8 = 1;
+
+    /// Attach a result collected during this command's known lifecycle phase.
+    ///
+    /// The caller must supply the command's real history ID, not a guessed
+    /// match from shell timestamps or a later repository inspection.
+    #[must_use]
+    pub fn new(
+        history_id: crate::history::HistoryId,
+        phase: GitObservationPhase,
+        observed_at: time::OffsetDateTime,
+        result: GitProbeResult,
+    ) -> Self {
+        let outcome = match result {
+            GitProbeResult::Observed(value) => GitObservationOutcome::Observed(value),
+            GitProbeResult::Unavailable(value) => {
+                GitObservationOutcome::Unavailable(value.into())
+            }
+        };
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            history_id,
+            phase,
+            observed_at,
+            outcome,
+        }
+    }
+}
+
 /// Fields observed from a working tree at one specific point in time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitObservation {
@@ -113,6 +190,60 @@ mod tests {
         let out = StdCommand::new("git").arg("-C").arg(cwd).args(args).output().unwrap();
         assert!(out.status.success(), "git command failed");
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn provenance_event_serializes_with_uuid_phase_and_unavailability() {
+        let id: crate::history::HistoryId =
+            "f54c2846d581412392d88856e1523822".parse().unwrap();
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let event = GitProvenanceEvent::new(
+            id,
+            GitObservationPhase::CommandStart,
+            observed_at,
+            GitProbeResult::Unavailable(GitProbeUnavailable::Timeout),
+        );
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains("command_start"));
+        assert!(encoded.contains("timeout"));
+        let decoded: GitProvenanceEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.history_id, id);
+        assert_eq!(decoded.schema_version, GitProvenanceEvent::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn same_history_id_can_hold_distinct_start_and_end_observations() {
+        let id: crate::history::HistoryId =
+            "f54c2846d581412392d88856e1523822".parse().unwrap();
+        let t = time::OffsetDateTime::UNIX_EPOCH;
+        let start = GitProvenanceEvent::new(
+            id,
+            GitObservationPhase::CommandStart,
+            t,
+            GitProbeResult::Observed(GitObservation {
+                root: "/repo".into(),
+                commit: Some("a".into()),
+                branch: Some("main".into()),
+                detached: false,
+                dirty: Some(false),
+            }),
+        );
+        let end = GitProvenanceEvent::new(
+            id,
+            GitObservationPhase::CommandEnd,
+            t + time::Duration::seconds(1),
+            GitProbeResult::Observed(GitObservation {
+                root: "/repo".into(),
+                commit: Some("b".into()),
+                branch: Some("topic".into()),
+                detached: false,
+                dirty: Some(false),
+            }),
+        );
+        assert_eq!(start.history_id, end.history_id);
+        assert_ne!(start.phase, end.phase);
+        assert_ne!(start.outcome, end.outcome);
     }
 
     #[tokio::test]
