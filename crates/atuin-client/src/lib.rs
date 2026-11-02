@@ -13,6 +13,7 @@ pub mod hub;
 pub mod ai_session;
 pub mod database;
 pub mod distro;
+pub mod git_provenance;
 pub mod history;
 pub mod import;
 pub mod logout;
