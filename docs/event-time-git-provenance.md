@@ -19,6 +19,12 @@ A command-time Git observation therefore needs to be carried *atomically with th
 
 Regression tests cover non-repositories, detached HEAD, basic tracked modifications, and explicit timeout. This stage can be reviewed and merged without a history schema or compatibility change.
 
+## Stage 1b: typed UUID-bound event (this branch)
+
+A `GitProvenanceEvent` now explicitly carries schema version 1, the exact Atuin `HistoryId`, `command_start` or `command_end` phase, observed timestamp, and an `observed` / `unavailable` outcome. Two observations from the same history ID need not have the same branch or commit. The envelope is serializable and tested, but **not yet persisted, transmitted, or surfaced to Copout**.
+
+The observer's results remain independent of the historical event until the start/end lifecycle is wired. A present `GitProvenanceEvent` must always be interpreted as a measured event, not as reconstructed state.
+
 ## Stage 2: authoritative event binding
 
 Choose whether to observe at command start, command end, or both. The two phases must have distinct labels: `git switch`, `git checkout`, `git commit`, and shell changes can mutate repository state during execution.
