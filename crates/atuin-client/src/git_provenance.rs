@@ -105,8 +105,9 @@ pub async fn observe_git(cwd: &Path) -> GitProbeResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::process::Command as StdCommand;
+
+    use super::*;
 
     fn git_ok(cwd: &Path, args: &[&str]) -> String {
         let out = StdCommand::new("git").arg("-C").arg(cwd).args(args).output().unwrap();
@@ -127,8 +128,17 @@ mod tests {
     async fn observes_current_branch_commit_and_tracked_changes() {
         let dir = tempfile::tempdir().unwrap();
         git_ok(dir.path(), &["init", "-q"]);
-        git_ok(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.org",
-            "commit", "--allow-empty", "-q", "-m", "init"]);
+        git_ok(dir.path(), &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
         let expected_commit = git_ok(dir.path(), &["rev-parse", "HEAD"]);
         let initial = observe_git(dir.path()).await;
         let GitProbeResult::Observed(initial) = initial else {
@@ -144,7 +154,7 @@ mod tests {
         assert_eq!(
             match observe_git(dir.path()).await {
                 GitProbeResult::Observed(value) => value.dirty,
-                _ => panic!("expected Git observation"),
+                GitProbeResult::Unavailable(_) => panic!("expected Git observation"),
             },
             Some(true)
         );
@@ -164,8 +174,17 @@ mod tests {
     async fn detached_head_is_not_misreported_as_a_branch() {
         let dir = tempfile::tempdir().unwrap();
         git_ok(dir.path(), &["init", "-q"]);
-        git_ok(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.org",
-            "commit", "--allow-empty", "-q", "-m", "init"]);
+        git_ok(dir.path(), &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ]);
         git_ok(dir.path(), &["checkout", "--detach", "-q", "HEAD"]);
         let GitProbeResult::Observed(observed) = observe_git(dir.path()).await else {
             panic!("expected Git observation");
