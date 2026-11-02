@@ -77,9 +77,7 @@ impl GitProvenanceEvent {
     ) -> Self {
         let outcome = match result {
             GitProbeResult::Observed(value) => GitObservationOutcome::Observed(value),
-            GitProbeResult::Unavailable(value) => {
-                GitObservationOutcome::Unavailable(value.into())
-            }
+            GitProbeResult::Unavailable(value) => GitObservationOutcome::Unavailable(value.into()),
         };
         Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -194,8 +192,7 @@ mod tests {
 
     #[test]
     fn provenance_event_serializes_with_uuid_phase_and_unavailability() {
-        let id: crate::history::HistoryId =
-            "f54c2846d581412392d88856e1523822".parse().unwrap();
+        let id: crate::history::HistoryId = "f54c2846d581412392d88856e1523822".parse().unwrap();
         let observed_at = time::OffsetDateTime::UNIX_EPOCH;
         let event = GitProvenanceEvent::new(
             id,
@@ -214,8 +211,7 @@ mod tests {
 
     #[test]
     fn same_history_id_can_hold_distinct_start_and_end_observations() {
-        let id: crate::history::HistoryId =
-            "f54c2846d581412392d88856e1523822".parse().unwrap();
+        let id: crate::history::HistoryId = "f54c2846d581412392d88856e1523822".parse().unwrap();
         let t = time::OffsetDateTime::UNIX_EPOCH;
         let start = GitProvenanceEvent::new(
             id,
