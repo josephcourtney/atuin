@@ -14,6 +14,7 @@ pub mod ai_session;
 pub mod database;
 pub mod distro;
 pub mod history;
+pub mod git_provenance;
 pub mod import;
 pub mod logout;
 pub mod logs;
